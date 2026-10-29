@@ -1163,7 +1163,7 @@ def manual_takeover_codes():
     return set(s["code"] for s in SYMBOLS
                if s.get("enabled") and s.get("manual_takeover"))
 
-DEFAULT_ACCT = ""   # 脱敏: 原为硬编码资金账号; 正常由界面注入 account 变量, 此处留空      # 兜底资金账号（正常由界面注入全局 account 变量，此为最后兜底）
+DEFAULT_ACCT = ""                # 兜底资金账号(正常由界面注入全局 account 变量); 已脱敏为空串
 
 # ---- 下单常量（对照某券商原生框架文档核对，见文件头说明）----
 OP_BUY = 23                   # 股票买入
