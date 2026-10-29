@@ -595,7 +595,13 @@ def main():
                 params["pyramid"] = copts["pyramid"]
             if "add_step_pct" in copts:
                 params["add_step_pct"] = copts["add_step_pct"]
-            r = run_backtest(stock_rows, idx_closes, params, copts, pstart, pend)
+            # NA1(2026-10-29 修复)：pyramid / add_step_pct 是【参数】不是【回测选项】，
+            #   上面已单独并入 params；原实现仍把整个 copts 传下去，触发 run_backtest 的
+            #   白名单校验 ValueError('未知回测选项键: add_step_pct, pyramid')，
+            #   main() 必然崩溃、一份结果都写不出来。此处先剔除这两个键。
+            _copts = {k: v for k, v in (copts or {}).items()
+                      if k not in ('pyramid', 'add_step_pct')}
+            r = run_backtest(stock_rows, idx_closes, params, _copts, pstart, pend)
             res[cid] = r
             print("  [%s] %-28s 收益 %+7.2f%%  最大回撤 %6.2f%%  买%d/卖%d  手续费%.0f"
                   % (cid, cname, r["return_pct"], r["max_drawdown_pct"],

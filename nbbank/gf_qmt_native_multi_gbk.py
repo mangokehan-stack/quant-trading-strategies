@@ -1690,10 +1690,21 @@ def is_trade_day(today=None):
     _init_trade_day_set()
 
     if _TRADEDAY_SET is not None:
-        # 在线拉取且日期在缓存覆盖范围内 → akshare
-        # 其他（缓存恢复 / 缓存覆盖不到但在缓存内）→ cache
-        _src = "akshare" if (_TRADEDAY_FETCHED_AT and _TRADEDAY_FETCHED_AT[:10] == _key) else "cache"
-        return (_key in _TRADEDAY_SET, _src)
+        # N6(2026-10-29 修复)：只在【缓存确实覆盖该日期】时才用集合作答。
+        #   原实现只要 _TRADEDAY_SET 非空就直接 return (_key in 集合)，而缓存往往只到某个
+        #   日期为止（如只到 2026-12-31）；跨年后查询 2027-01-04 落在集合外 -> 直接判
+        #   「不是交易日」-> 整日停摆，连止盈都被挡下（报告 N6/NB-1）。
+        #   现改为：日期超出缓存覆盖范围时不下结论，继续往下走内置节假日表/工作日兜底。
+        _cov_ok = True
+        if _TRADEDAY_LAST_DATE:
+            try:
+                _cov_ok = (_key <= str(_TRADEDAY_LAST_DATE)[:10])
+            except Exception:
+                _cov_ok = True
+        if _cov_ok:
+            _src = "akshare" if (_TRADEDAY_FETCHED_AT and _TRADEDAY_FETCHED_AT[:10] == _key) else "cache"
+            return (_key in _TRADEDAY_SET, _src)
+        # 超出覆盖范围：落到下方 builtin / 工作日兜底
 
     # T-1(2026-10-19 第十五轮补充)：内置 2026 节假日表兜底（零依赖，不联网、不读缓存、不装任何库）。
     #   取值优先级：akshare在线 > 本地缓存 > 内置节假日表 > 仅看周末 > 拦截。
@@ -1714,8 +1725,17 @@ def is_trade_day(today=None):
     #   现按注释的原本意图改为 return (False, "unknown")：拿不准时全天不交易。
     #   说明：T-1 内置节假日表已把 2026 年绝大多数情况挡在前面；能走到这里只剩「年份超出表内范围」
     #   （如 2027 年及以后）且缓存也读不到这一种情况。属「宁可错过不可错买」的保守取舍，与数据门 fail-closed 口径一致。
-    #   init 会打印「数据源=无法确认(防御拦截·当日不交易)」并说明当日不产生任何委托，属预期行为。
-    return (False, "unknown")
+    #   init 会打印「数据源=无法确认」并说明当日交易判定为保守放行。
+    #
+    # N6(2026-10-29 修复)：由「全天拦截」改为「工作日放行 + 醒目告警」。
+    #   原因：原策略在「缓存覆盖不到 + 内置表无该年份」时直接判定非交易日，会把当天
+    #   所有动作全部停掉，连止盈都跑不了（漏卖比误买风险更大，且次日不会自动补）。
+    #   现在的工作日兜底口径：
+    #     · 周六/周日 -> 休市（已在上面 return）
+    #     · 周一至周五 -> 视为交易日放行，safe：passorder 若逢真假日会被券商拒单，
+    #       策略侧有拒单退避与冷却，不会造成实际损失；而漏掉止盈的代价更高。
+    #   init 阶段仍会通过 source='weekday_fallback' 打出「节假日表缺失请补表」告警。
+    return (True, "weekday_fallback")
 
 
 def previous_trading_day(day_str, max_back=15):
@@ -2023,11 +2043,49 @@ def _lock_and_write_impl(path, write_fn, retry=2):
             _done = True
         except Exception:
             pass
+        # NI-4(2026-10-29 修复)：QMT 沙箱会拒绝 os.replace 覆盖已存在文件，原实现直接抛错
+        #   且不清理 tmp —— 首次保存成功后，此后每次保存都失败，每 bar 泄漏一个 .tmp，
+        #   状态永远落不了盘（首仓/M2/M3 全部冻结）。现补三级回退：
+        #   ① 目标改名为 .prev -> 再次 replace -> 成功则删 .prev；
+        #   ② 仍失败则回滚 .prev 原名，保住旧数据；
+        #   ③ 无论成败都清理 tmp，杜绝泄漏。
+        if not _done:
+            _prev = path + ".prev"
+            _moved_prev = False
+            try:
+                if os.path.exists(path):
+                    try:
+                        os.unlink(_prev)
+                    except Exception:
+                        pass
+                    os.rename(path, _prev)
+                    _moved_prev = True
+                try:
+                    os.rename(tmp, path)       # 目标已腾空，rename 通常不被沙箱拒绝
+                    _done = True
+                except Exception:
+                    if _moved_prev:
+                        try:
+                            os.rename(_prev, path)   # 回滚旧文件
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            finally:
+                if _done:
+                    try:
+                        os.unlink(_prev)
+                    except Exception:
+                        pass
         if not _done:
             # 全局审计修复：原子替换失败时绝不删除或截断完好的旧目标文件。
-            # 保留 tmp 供人工诊断，由调用方进入持久化降级保护。
+            # NI-4：tmp 必须清理，避免每 bar 泄漏一个临时文件。
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
             _LW_STATUS[path] = "failed"
-            raise IOError("原子替换失败，已保留旧文件和临时文件: %s" % path)
+            raise IOError("原子替换失败(已尝试 .prev 回退)，旧文件已保留: %s" % path)
         _LW_STATUS[path] = "ok"
     finally:
         if locked:
@@ -2041,16 +2099,25 @@ def _rotate_log_if_needed(path):
     """在锁内检查大小，超上限则轮转 .1/.2/.../.N（N=LOG_BACKUP_COUNT；
     保持 QMT 环境仅用 os 模块，不依赖 logging.handlers）。"""
     global _LOG_FP
-    if _LOG_FP is not None and os.path.abspath(path) == os.path.abspath(TRADE_LOG):
+    # NI-3(2026-10-29 修复)：此函数每次 log() 都会被调用，原实现在【任何一次调用】都先关闭
+    #   日志句柄 —— 等于每写一行日志前先关一次文件，句柄永远复用不上，QMT 沙箱下表现为
+    #   「0/5 行真正落盘」、每次重启还白占 2 个备份位。现改为：只有【确实要轮转】时才关句柄。
+    _is_trade_log = (_LOG_FP is not None
+                     and os.path.abspath(path) == os.path.abspath(TRADE_LOG))
+    if not os.path.exists(path):
+        return
+    try:
+        if os.path.getsize(path) < LOG_MAX_BYTES:
+            return            # 未达轮转阈值：保持句柄打开，直接返回
+    except Exception:
+        return
+    # ↓ 以下才真正执行轮转：此时才需要先释放句柄
+    if _is_trade_log:
         try:
             _LOG_FP.flush(); _LOG_FP.close()
         except Exception:
             pass
         _LOG_FP = None
-    if not os.path.exists(path):
-        return
-    if os.path.getsize(path) < LOG_MAX_BYTES:
-        return
     for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
         old = "%s.%d" % (path, i)
         new = "%s.%d" % (path, i + 1)
@@ -2566,6 +2633,8 @@ _INSTANCE_LOCK_STALE_SEC = 600.0    # 锁心跳超过该秒数视为陈旧残留
 _INSTANCE_LOCK_ACQUIRED = False     # 本实例是否持有锁（False=只观察、禁止下单）
 _INSTANCE_LOCK_LAST_TOUCH = 0.0     # 上次锁心跳续命时间戳（60s 节流写盘）
 _INSTANCE_LOCK_WARN_TS = 0.0        # 双实例拦截提示日志节流
+_INSTANCE_LOCK_READ_FAILS = 0       # NI-2：锁文件连续读取失败计数(成功即清零)
+_INSTANCE_LOCK_READ_FAIL_MAX = 3    # NI-2：连续失败达到该次数才判他人持锁(防瞬时IO抖动误停)
 _INSTANCE_LOCK_TOKEN = ("%s-%s-%s" % (os.getpid(), int(time.time() * 1000000),
                                       os.urandom(8).hex()))  # N9：实例唯一令牌
 
@@ -2595,10 +2664,35 @@ def _instance_lock_acquire():
                     _lock_data = json.loads(_f.read() or "{}") or {}
                 _ts = float(_lock_data.get("hb", 0.0) or 0.0)
                 _lock_read_ok = True
+                globals()['_INSTANCE_LOCK_READ_FAILS'] = 0   # NI-2：读成功即清零失败计数
             except Exception:
                 _lock_read_ok = False
             if not _lock_read_ok:
-                return False          # 锁文件存在但读不了，保守视为有效锁
+                # NI-2(2026-10-29 修复)：读取失败不再「一次性判死」。
+                #   原实现只要读不了就 return False（视为他人持锁），而 QMT 沙箱下共享读失败
+                #   很常见（杀软/共享锁/文件被外部占用），一旦持续就是约 540 秒全停，
+                #   连止盈都被拦下；stop 时未释放的锁也会让下次启动立刻停摆。
+                #   现改为：① 先按文件 mtime 判断是否陈旧（陈旧则直接抢占）；
+                #          ② 未陈旧则累计连续失败计数，达到阈值才判他人持锁；
+                #          ③ 计数在成功读取时清零，瞬时抖动不会累积成停摆。
+                _lock_fail_n = int(globals().get('_INSTANCE_LOCK_READ_FAILS', 0) or 0) + 1
+                globals()['_INSTANCE_LOCK_READ_FAILS'] = _lock_fail_n
+                try:
+                    _mt = os.path.getmtime(_INSTANCE_LOCK_FILE)
+                except Exception:
+                    _mt = 0.0
+                if _mt > 0 and (_now - _mt) >= _INSTANCE_LOCK_STALE_SEC:
+                    # 文件本身已陈旧：读不出内容也照样允许抢占
+                    try:
+                        os.remove(_INSTANCE_LOCK_FILE)
+                    except Exception:
+                        pass
+                    continue
+                if _lock_fail_n < _INSTANCE_LOCK_READ_FAIL_MAX:
+                    continue      # 瞬时读取失败：本轮跳过，下轮重试，不计为他人持锁
+                log("【单实例锁】锁文件连续%d次读取失败，本轮按他人持锁处理(只观察)"
+                    % _lock_fail_n)
+                return False
             if _ts > 0 and (_now - _ts) < _INSTANCE_LOCK_STALE_SEC:
                 return False          # 活跃锁：另一实例正在运行，本实例只观察
             try:
@@ -7476,7 +7570,12 @@ def sell_all(C, code, acct, price, reason, state=None, allow_manual=False):
                 log("【卖出钳制(手工仓策略不代卖)】%s 券商%d股全部为手工仓(策略账本0股)，策略不代卖手工仓，拒绝卖出(%s)"
                     % (_cn(code), int(pos_vol), reason))
                 return False
-            vol = min(vol, _strat_sell_a35)
+            # NEW-E(2026-10-29 修复)：can_use 是【账号级】当日可卖量，含手工仓。
+            #   策略仓今天买入(T+1 不可卖)、手工仓可卖时，vol 会取到手工仓数量并把它卖掉，
+            #   违反 manual_takeover=False「手工仓完全不由策略卖出」，用户当天也卖不了自己的票。
+            #   现扣除手工仓份额后再钳制；手工仓为 0 时与原行为完全一致。
+            _can_use_strat_a35 = max(0, int(can_use) - _ms_sell_a35)
+            vol = min(vol, _strat_sell_a35, _can_use_strat_a35)
         if pos_vol > 0 and vol <= 0:
             log("【T+1限制(今天买的明天才能卖)】%s 持仓%d股但当日可卖为0，本次不卖，剩余股份次日自动重试" % (_cn(code), pos_vol))
             return False
@@ -9713,6 +9812,7 @@ def init(C):
         _is_td, _td_src = is_trade_day()
         _td_label = {"akshare": "akshare在线", "cache": "本地缓存",
                      "builtin": "内置节假日表(零依赖)",
+                     "weekday_fallback": "仅按周末判断(工作日放行·请补放假表)",
                      "weekend_fallback": "仅周末降级",
                      "unknown": "无法确认(普通工作日仅允许卖出)"}.get(_td_src, _td_src)
         _now_date = datetime.now().date()
@@ -9721,10 +9821,11 @@ def init(C):
         _calendar_warn = (_bi_cur is None or
                           (_now_date.month >= 12 and _max_builtin_year <= _now_date.year))
         if _calendar_warn:
-            log("【放假日历过期·警告】内置的放假日历目前只覆盖到 %s 年，现在已经是 %d 年 —— 等到了那年如果既连不上"
-                "网络读不到 akshare、又读不到本地缓存，搞不清是不是工作日时会进入「只允许卖、不让买」模式"
-                "（止盈/卖出继续，买入拦截）。请在每年 12 月交易所公布次年休市安排后，把新一年的"
-                "工作日休市日补进 _BUILTIN_CLOSED_WORKDAYS、周末补班日补进 _BUILTIN_OPEN_WEEKENDS。"
+            log("【放假日历过期·警告】内置的放假日历目前只覆盖到 %s 年，现在已经是 %d 年 —— 若届时既连不上网络"
+                "读不到 akshare、又读不到本地缓存，将退化为「工作日一律按交易日放行、周末休市」"
+                "（N6：不再全天停摆，止盈/卖出/买入都照常跑，但法定假日当天会尝试发单、由券商拒单兜住）。"
+                "请在每年 12 月交易所公布次年休市安排后，把新一年的工作日休市日补进"
+                " _BUILTIN_CLOSED_WORKDAYS、周末补班日补进 _BUILTIN_OPEN_WEEKENDS。"
                 % ("/".join(str(y) for y in sorted(_BUILTIN_CLOSED_WORKDAYS)),
                    datetime.now().year))
         _td_mode, _td_src = _trade_day_order_mode()
