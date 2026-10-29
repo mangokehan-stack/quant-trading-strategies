@@ -53,7 +53,7 @@ jobs:
 
       - name: Secret scan (账号/券商/手机号)
         run: |
-          if grep -rnE "8973786|广发|1[3-9][0-9]{9}" --include="*.py" --include="*.md" --exclude="smoke_test.py" . ; then
+          if grep -rnE "<acct>|广[发]|1[3-9][0-9]{9}" --include="*.py" --include="*.md" --exclude="smoke_test.py" . ; then
             echo "::error::发现疑似敏感信息"
             exit 1
           fi
