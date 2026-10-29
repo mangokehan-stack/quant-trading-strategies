@@ -21,10 +21,14 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-PY = r'<PYTHON_EXE>'
+# PUB-1(d)(2026-10-29 修复)：原为硬编码本机解释器绝对路径（发布后成解释器占位符，两步都
+#   FileNotFoundError）。改用当前运行解释器，跨机可移植；需指定时用环境变量 ZT_PYTHON 覆盖。
+PY = os.environ.get('ZT_PYTHON') or sys.executable or 'python'
 LOG = os.path.join(BASE, 'zt_shrink_daily_task_runner.log')
 STEP_LOG = os.path.join(BASE, 'zt_shrink_daily_task.log')
-ACCOUNT = '<ACCT>'
+# PUB-1(a)(2026-10-29 修复)：账号不硬编码（发布后会变成账号占位符，风险清单工具拿到非法账号）。
+#   改为环境变量 ZT_ACCOUNT 优先；未设置则传空串，由工具按界面注入账号处理。
+ACCOUNT = os.environ.get('ZT_ACCOUNT') or ''
 
 
 def wlog(msg):

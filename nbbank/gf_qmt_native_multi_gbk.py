@@ -1163,7 +1163,7 @@ def manual_takeover_codes():
     return set(s["code"] for s in SYMBOLS
                if s.get("enabled") and s.get("manual_takeover"))
 
-DEFAULT_ACCT = "<你的资金账号>"      # 兜底资金账号（正常由界面注入全局 account 变量，此为最后兜底）
+DEFAULT_ACCT = ""   # 脱敏: 原为硬编码资金账号; 正常由界面注入 account 变量, 此处留空      # 兜底资金账号（正常由界面注入全局 account 变量，此为最后兜底）
 
 # ---- 下单常量（对照某券商原生框架文档核对，见文件头说明）----
 OP_BUY = 23                   # 股票买入
@@ -1217,16 +1217,50 @@ try:
 except Exception:
     _ENV_DIR = ""
 _BASE_DIR_SRC = "cwd"           # BASE_DIR 命中来源（env/file/cwd），init 自检输出
+# PUB-1(b)(2026-10-29 修复)：发布版把 _FIXED_DIR 去掉后只剩 env/__file__/cwd 三级回退，
+#   而 QMT 内置 Python 里 __file__ 通常不存在 -> 静默落到 cwd(= <QMT_ROOT>\\bin.x64)。
+#   后果（报告 NI-5 实测）：原状态文件在策略目录，新路径指向 bin.x64 -> 旧状态读不到
+#   -> 存量 9500 股被当成外部手工仓、且永不触发止盈。
+#   现策略：① 仍优先 env(GF_BASE_DIR)；② 其次固定目录文件 gf_fixed_dir.txt（可手工指定，
+#   与策略同盘的绝对路径，重启稳定）；③ 再次 __file__；④ 最后才 cwd，并【响亮告警】。
+def _read_fixed_dir():
+    """读取与脚本同目录的 gf_fixed_dir.txt 第一行（显式指定的绝对目录）。读不到返回 ''。"""
+    try:
+        _cands = []
+        try:
+            _cands.append(os.path.dirname(os.path.abspath(__file__)))
+        except Exception:
+            pass
+        try:
+            _cands.append(os.getcwd())
+        except Exception:
+            pass
+        for _d in _cands:
+            _f = os.path.join(_d, 'gf_fixed_dir.txt')
+            if os.path.isfile(_f):
+                with open(_f, 'r', encoding='utf-8', errors='ignore') as _fh:
+                    _ln = (_fh.readline() or '').strip()
+                if _ln:
+                    return _ln
+    except Exception:
+        pass
+    return ''
+
 if _ENV_DIR:
     _BASE_DIR = _ENV_DIR
     _BASE_DIR_SRC = "env"
 else:
-    try:
-        _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        _BASE_DIR_SRC = "file"
-    except Exception:
-        _BASE_DIR = os.getcwd()
-        _BASE_DIR_SRC = "cwd"
+    _FIXED_DIR = _read_fixed_dir()
+    if _FIXED_DIR:
+        _BASE_DIR = _FIXED_DIR
+        _BASE_DIR_SRC = "fixed"
+    else:
+        try:
+            _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+            _BASE_DIR_SRC = "file"
+        except Exception:
+            _BASE_DIR = os.getcwd()
+            _BASE_DIR_SRC = "cwd"
 STATE_FILE = os.path.join(_BASE_DIR, "gf_native_multi_state.json")     # 多标的持仓状态(按code分桶)
 M3_STATE_FILE = os.path.join(_BASE_DIR, "gf_native_multi_m3.json")       # 多标的盘中加仓状态(按code分桶)
 TRADE_LOG = os.path.join(_BASE_DIR, "gf_native_trade.log")       # 交易决策日志
@@ -1252,6 +1286,21 @@ except Exception:
     _MIRROR_DIR = os.path.join(_BASE_DIR, "gf_qmt_mirror")
 _MIRROR_WARN_GAP = 60.0        # 镜像写失败告警去重间隔（秒）
 _MIRROR_LAST_WARN = 0.0        # 上次镜像告警时间戳
+# PUB-1(b)(2026-10-29)：BASE_DIR 落到 cwd（QMT 下多为 bin.x64）属于危险退化——
+#   状态/台账会写进安装目录，重启后可能读不回旧状态（报告 NI-5：9500 股变手工仓）。
+#   这里显式打一条醒目告警，便于 init 自检时一眼发现；不影响交易。
+try:
+    if _BASE_DIR_SRC == 'cwd':
+        _bdw = ('【目录退化告警(PUB-1)】BASE_DIR 未定位到策略目录，已回退到当前工作目录 %s。'
+                '状态/台账将写在该目录，重启后可能读不回旧状态。'
+                '请在策略目录放 gf_fixed_dir.txt(内容为策略绝对目录) 或设置 GF_BASE_DIR。'
+                % _BASE_DIR)
+        try:
+            log(_bdw)
+        except Exception:
+            print(_bdw)
+except Exception:
+    pass
 
 
 def _mirror_copy(relname):
@@ -2407,7 +2456,7 @@ def _mode_pending_recheck():
     init 探测常错过 → 置 _trade_mode_pending；handlebar 首次进入时补测一次即可命中。
     命中后清 pending 并记日志；未命中保持 pending，下根 bar 再试。
     """
-    global _trade_mode_pending
+    global _trade_mode_pending, _MODE_RECHECK_LAST
     if not _trade_mode_pending:
         return
     _tm, _tp, _ta, _tn = _probe_trade_mode(retries=1)
@@ -5216,7 +5265,7 @@ def resolve_account(C, code=""):  # AUD34(2026-10-08 第二轮零预设审计)�
         # 追加推送风险事件文件，确保账号配置错误进入 gf_risk_events.log 持久留痕。
         _notify_risk("account_fallback",
                      "%s 回退到硬编码默认账号 %s，请人工核对资金账号配置" % (code or "(未知代码)", DEFAULT_ACCT))
-        acct = DEFAULT_ACCT     # 最后兜底（<ACCT>）
+        acct = DEFAULT_ACCT     # 最后兜底（DEFAULT_ACCT）
     return acct
 
 
@@ -5748,13 +5797,26 @@ def _emit_trade(trigger, code, side, vol, price, params, result, detail=""):
         % (code, code, side, vol, price, trigger, _r, _p, detail))
 
 
-def _ledger_append_nb(side, code, vol, price, trigger, state=None, manual=False):
+def _ledger_append_nb(side, code, vol, price, trigger, state=None, manual=False, acct=None):
     # nbbank 账本变动监控 CSV 写入器（路径A：复刻 dxgp 逐笔成交账本）
     # 仅在策略实际发单(SEND)时调用；记录拟成交价/股数，供外部监控脚本增量读取。
     # 说明：捕获的是「策略已发单」而非「已成交回报」(nbbank 无 deal_callback)；
     #      券商端手工卖出不会被本函数捕获。
     try:
-        _p = os.path.join(_BASE_DIR, 'gf_native_pnl_<ACCT>.csv')
+        # PUB-1(a)(2026-10-29 修复)：CSV 文件名不得含硬编码账号，更不得含 <>/\\ 等
+        #   Windows 非法字符（旧发布副本误写成带尖括号的账号占位符，每次 BUY/SELL
+        #   走到 open() 必抛异常 -> 账本 CSV 永远写不出来，且日志里刷 traceback）。
+        #   改为按真实资金账号派生文件名；取不到账号时退化为无后缀文件名（仍可写）。
+        _acct_p1 = str(acct or '').strip()
+        if not _acct_p1:
+            try:
+                _acct_p1 = str(resolve_account(None, code) or '').strip()
+            except Exception:
+                _acct_p1 = ''
+        # 只保留字母数字，杜绝任何非法文件名字符
+        _acct_p1 = ''.join(_ch for _ch in _acct_p1 if _ch.isalnum())
+        _pnl_fn = ('gf_native_pnl_%s.csv' % _acct_p1) if _acct_p1 else 'gf_native_pnl.csv'
+        _p = os.path.join(_BASE_DIR, _pnl_fn)
         _now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         _dir = '买入' if side == 'BUY' else '卖出'
         _nm = _stock_name(code)
@@ -6791,6 +6853,37 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
         _before_total = int(_ss.get("position_shares", 0) or 0) + int(_ss.get("manual_shares", 0) or 0)
         _sold = max(0, min(int(_ss.get("vol", 0) or 0), _before_total - int(actual_vol or 0)))
         if _sold > 0:
+            # P1-2(2026-10-29 修复)：卖出必须真正扣减【策略账本】，
+            #   原实现只记盈亏(_pnl_record_close)和手工仓，position_shares / total_cost /
+            #   deployed 一个都不减 —— 部分成交或 T+1 剩余时，策略仍按「卖前股数」记账，
+            #   实际券商只剩残股 -> 残股被后续同步判成手工仓(用户手工仓被吞)，
+            #   且 total_cost 虚高 -> 均价虚高 -> 止盈永不触发 / 策略误判亏损而暂停。
+            #   现按「实际卖出量」等比扣减策略账本；手工仓部分单独在上面扣，互不串账。
+            _ps_before_p12 = int(_ss.get("position_shares", 0) or 0)
+            _m_before_p12 = int(_ss.get("manual_shares", 0) or 0)
+            # 手工仓先吸收本次卖出(allow_manual 时)，余量才算策略自己的卖出
+            _sold_manual_p12 = min(_sold, _m_before_p12) if _ss.get("allow_manual") else 0
+            _sold_strat_p12 = max(0, min(_sold - _sold_manual_p12, _ps_before_p12))
+            if _sold_strat_p12 > 0 and _ps_before_p12 > 0:
+                _cost_before_p12 = float(_ss.get("total_cost", 0.0) or 0.0)
+                # 按股数比例折算被卖出的成本(与 _pnl_record_close 口径一致)
+                _cost_out_p12 = _cost_before_p12 * (_sold_strat_p12 / float(_ps_before_p12))
+                _ps_after_p12 = max(0, _ps_before_p12 - _sold_strat_p12)
+                state["position_shares"] = _ps_after_p12
+                state["expected_shares"] = _ps_after_p12
+                state["total_cost"] = max(0.0, _cost_before_p12 - _cost_out_p12)
+                state["deployed"] = max(0.0, float(state.get("deployed", 0.0) or 0.0) - _cost_out_p12)
+                if _ps_after_p12 == 0:
+                    # 策略仓已清空：成本/额度归零，避免残留
+                    state["total_cost"] = 0.0
+                    state["last_add_price"] = 0.0
+                else:
+                    state["last_add_price"] = state["total_cost"] / _ps_after_p12
+                log("[%s] 【卖出账本结算(P1-2)】卖出%d股(其中策略仓%d股/手工仓%d股)；"
+                    "策略持仓 %d->%d 股，成本扣减%.2f元，剩余额度%.2f元"
+                    % (code, _sold, _sold_strat_p12, _sold_manual_p12,
+                       _ps_before_p12, _ps_after_p12, _cost_out_p12,
+                       float(state.get("deployed", 0.0) or 0.0)))
             if _ss.get("allow_manual"):
                 _m_before = int(_ss.get("manual_shares", 0) or 0)
                 _m_sold = min(_sold, _m_before)
@@ -6939,7 +7032,11 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
     #   策略空仓且无在途单时 _ms_new_a35 == actual_vol，与本修复前行为完全一致。
     _ps_a35 = int(state.get("position_shares", 0) or 0)
     _pd_a35 = int(_PENDING_BUYS.get(code, 0) or 0)
-    _strat_reach_a35 = max(0, _ps_a35 + _pd_a35)
+    # P1-4(2026-10-29 修复)：position_shares 已在下单成功时即时 += vol 预记(L7791/L8020/L9227)，
+    #   再叠加 pending 等于把在途量算了两遍 -> _strat_reach 虚高 -> manual_shares 被压成 0，
+    #   用户的真实手工仓被策略账本吞掉(报告场景: 策略4000+手工1000, 加仓后被吞)。
+    #   策略可解释上限只取 position_shares；pending 仅作为「在途未落账」的闸门存在，不进入上限。
+    _strat_reach_a35 = max(0, _ps_a35)
     _ms_new_a35 = int(actual_vol) - _strat_reach_a35
     if _ms_new_a35 < 0:
         _ms_new_a35 = 0
@@ -7075,7 +7172,11 @@ def verify_position_before_order(C, acct, code, state, side, price=0.0):
     if pending > 0:
         if actual_strategy == expected:
             if actual > 0:
-                _pending_ledger_settle(code, state, actual)
+                # P1-1(2026-10-29 修复)：此处绝不做账本结算。
+                #   QMT 持仓可见有约3s延迟，"持仓已追平"不代表订单已终结——
+                #   结算会把 state 整体回滚到下单前快照(tier/first_batch/manual 全丢)，
+                #   下一根 bar 策略认为没买过而重复下单(实测 2×1200 变 4×1200)。
+                #   账本只由终态结算点(L6117 委托确认终结)负责；此处仅清在途量。
                 _pending_clear(code, "券商持仓已追平在途买单")
                 return True, actual, can_use, "一致"
             # 「内部空仓 + 有在途买单」是矛盾态（状态被误重置的残留）。
@@ -7088,7 +7189,9 @@ def verify_position_before_order(C, acct, code, state, side, price=0.0):
             # 「写穿」行为对齐，防重启瞬间读到偏大的旧在途台账（零买卖行为变更）
             _PENDING_TS[code] = time.time()
             _pending_save()
-            _pending_ledger_settle(code, state, actual)
+            # P1-1(2026-10-29 修复)：部分成交时订单仍在飞行，绝不是终态，
+            #   不得结算(否则回滚 tier/首仓标记，且 _PENDING_LEDGER 单槽被覆盖丢单)。
+            #   在途量已在上面按实际成交收敛，账本留待终态结算点统一处理。
             return True, actual, can_use, "在途买单%d股可解释差额" % pending
     elif actual_strategy == expected:
         return True, actual, can_use, "一致"
@@ -7304,7 +7407,7 @@ def buy_shares(C, code, acct, price, vol, reason, state=None, cap=None):
             return False
         _pending_ledger_begin(code, state, vol, order_price or price, reason)
 
-        _ledger_append_nb("BUY", code, vol, order_price or price, "买入-" + reason, state)
+        _ledger_append_nb("BUY", code, vol, order_price or price, "买入-" + reason, state, acct=acct)
         _pending_add(code, vol)   # 登记在途买单（含时间戳，供超时结算）
         # 2026-09-30：隐藏可用资金信息，仅保留买入数量与价格
         log("【买入】%s %d股(%s,限价%.2f) | %s | passorder(下单指令)=%s"
@@ -7463,7 +7566,7 @@ def sell_all(C, code, acct, price, reason, state=None, allow_manual=False):
         except Exception as _spe:
             log("【卖出冻结窗(挂卖单后短时冻结再买)设置异常】%s %s（不影响已发出的委托）" % (_cn(code), _spe))
         # AUD32(2026-10-07 铁律审计)：卖出成交确认——触发类型 + 实际参数 + 结论。
-        _ledger_append_nb("SELL", code, vol, order_price or price, "卖出-" + reason, state, manual=allow_manual)
+        _ledger_append_nb("SELL", code, vol, order_price or price, "卖出-" + reason, state, manual=allow_manual, acct=acct)
         _emit_trade("卖出-" + reason, code, "SELL", vol, price,
                     {"委托价": order_price or price, "数量": vol, "卖出滑点": LIMIT_SLIP_PCT_SELL,
                      "委托类型": _pt, "passorder": _ret}, "SEND", "passorder 返回 %s" % _ret)
@@ -8701,8 +8804,16 @@ def _handlebar_impl(C, code, cfg, params, state):
     # 若券商股数高于该下界，说明已有部分成交或存在外部持仓，一律以券商为准同步，
     # 避免内部状态长期偏离真实持仓（过宽会把「部分成交」也当成未落账而迟迟不收敛）。
     _pend = _PENDING_BUYS.get(code, 0)
-    _in_flight = (_pend > 0 and actual_vol != state["position_shares"]
-                  and actual_vol == state["position_shares"] - _pend)
+    # P1-3(2026-10-29 修复)：在途判定必须在同一把尺子上比较。
+    #   actual_vol 是【券商总持仓】(含手工仓)，position_shares 是【策略口径】(不含手工仓)，
+    #   原实现直接用 actual_vol 与策略账本做等式，只要账户里还有手工仓就永远不成立，
+    #   -> 判为「非在途」-> 走外部交易同步分支 -> 策略自己的加仓被登记成手工仓，
+    #      策略账本不增、成本不增，止盈按错成本判、手工仓被策略吞掉。
+    #   现统一折算到策略口径 (负值钳 0)；手工仓为 0 时与旧行为完全一致。
+    _ms_inf = int(state.get("manual_shares", 0) or 0)
+    _actual_strat_inf = max(0, int(actual_vol) - _ms_inf)
+    _in_flight = (_pend > 0 and _actual_strat_inf != state["position_shares"]
+                  and _actual_strat_inf == state["position_shares"] - _pend)
     if _in_flight:
         _log_dup_guard(code, "在途买单%d股尚未落账(内部记录%d股/券商%d股)，保持状态等待成交回报"
                        % (_pend, state["position_shares"], actual_vol))
@@ -8739,8 +8850,14 @@ def _handlebar_impl(C, code, cfg, params, state):
         _ps34 = int(actual_vol) - _ms_sh34
         if _ps34 < 0:
             _ps34 = 0
+        # P1-4(2026-10-29 修复)：部分成交时订单仍在飞行，pending 绝不能清。
+        #   原条件只看 _ps34 == expected_shares，券商先成交一部分(如 1000 股中成交 400)
+        #   并且 _ps34 恰好等于 expected 时，pending 被清 -> 剩余在途量失去闸门保护，
+        #   下一根 bar 把未成交部分误记成手工仓，策略成本虚高、止盈永不触发。
+        #   现要求 pending 已归零(即 _pending_ledger_settle 已在终态结算点收敛完毕)才清。
         if (_ps34 == state.get("expected_shares", _ps34)
-                and (_ps34 > 0 or _PENDING_BUYS.get(code, 0) == 0)):
+                and _ps34 > 0
+                and _PENDING_BUYS.get(code, 0) == 0):
             _pending_clear(code, "券商已追平在途买单")
             # 持仓追平=委托实际成交 -> 此前“超时未成交”判定是误判，清零失败计数/熔断
             if _ps34 > 0:
@@ -9438,7 +9555,15 @@ def handlebar(C):
     _heartbeat_tick()         # 存活打点：检测每 bar 执行，输出按状态门控（非交易日/非交易时段静默）
     _instance_lock_acquire()  # AUD34-P3：单实例锁幂等获取（init 失败时每 bar 补试；持锁后零开销）
     _instance_lock_touch()    # AUD34-P3：锁心跳续命（60s 节流写盘）
-    _mode_pending_recheck()   # 运行模式延迟补测（init 探测不到时首根 bar 补一次）
+    try:
+        _mode_pending_recheck()   # 运行模式延迟补测（init 探测不到时首根 bar 补一次）
+    except Exception as _e_rchk:
+        # P1-5(2026-10-29)：补测异常绝不能拖垮本根 bar 的全部交易逻辑（止盈/卖出/买入），
+        #   失败仅记日志，下根 bar 自然重试。
+        try:
+            log("【运行模式补测-异常】%s: %s；本根bar忽略，下根继续" % (type(_e_rchk).__name__, _e_rchk))
+        except Exception:
+            pass
     with _STATE_LOCK:
         for sym in enabled_symbols():
             code = sym["code"]
