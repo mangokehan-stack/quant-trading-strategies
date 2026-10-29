@@ -324,7 +324,19 @@ def main(argv=None):
     # T1：旧文件中的未来日期只是推测，不能永久并入。每次以真实历史重建未来段。
     _old_real = str((old_json or {}).get('last_real_date', '') or '')
     if hist_days:
-        last_real_date = max(d for d in hist_days if d <= datetime.datetime.now().strftime('%Y%m%d'))
+        _new_real = max(d for d in hist_days if d <= datetime.datetime.now().strftime('%Y%m%d'))
+        # P3-T1/NB1(2026-10-29 修复)：last_real_date 必须【单调不降】。
+        #   原实现直接用本次抓取结果覆盖，一旦数据源返回部分/陈旧数据（接口限流、缓存过期、
+        #   只回补了半年），last_real_date 会倒退 —— 于是原本已确认为「真实历史」的日期
+        #   被降级成「推测未来」，下次重建时会用工作日+内置节假日表重新生成，把真历史换成假日期
+        #   （报告 NB1：20260102/20260223 被当成交易日长期保留）。
+        #   现取新旧较大者；只有新数据确实推进时才更新。
+        if _old_real and _old_real > _new_real:
+            last_real_date = _old_real
+            print('[提示] 本次抓取历史(%s)早于已知真实边界(%s)，保留较新边界(防历史被降级)'
+                  % (_new_real, _old_real))
+        else:
+            last_real_date = _new_real
         old_hist = {d for d in old_days if d <= last_real_date}
         all_days = old_hist | hist_days
     else:

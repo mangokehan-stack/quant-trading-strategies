@@ -136,13 +136,25 @@ def scan_instances():
             parts = ln.split(',')
             if len(parts) < 5:
                 continue
-            exe = parts[-1]
-            if 'XtItClient' not in exe:
+            # P3-NB3(2026-10-29 修复)：wmic /format:csv 的实际列序是
+            #   Node,CreationDate,ExecutablePath,ParentProcessId,ProcessId
+            #   原实现用 parts[-1] 当 exe（其实是 ProcessId）、parts[-2] 当 pid（其实是
+            #   ParentProcessId），永远匹配不到 'XtItClient'，回退分支恒为空 —— 于是
+            #   「没装 wmic 的机器上前提条件永远不成立」，等于扫描实例功能整条失效。
+            #   现按真实列序取值，并对表头行与空列做保护。
+            _hdr0 = parts[0].strip().lower()
+            if _hdr0 in ('node', 'hostname') and len(parts) >= 2 \
+                    and not parts[1].strip().isdigit():
+                continue                      # 跳过表头
+            _exe = parts[2].strip() if len(parts) >= 5 else ''
+            if 'XtItClient' not in _exe:
                 continue
-            pid = parts[-2]
-            ppid = parts[-3]
-            cd = parts[-4]
-            out.append({'pid': pid, 'ppid': ppid, 'exe': exe, 'created': cd})
+            _cd = parts[1].strip() if len(parts) >= 5 else ''
+            _ppid = parts[3].strip() if len(parts) >= 5 else ''
+            _pid = parts[4].strip() if len(parts) >= 5 else ''
+            if not _pid.isdigit():
+                continue                      # pid 非数字: 列错位, 丢弃该行
+            out.append({'pid': _pid, 'ppid': _ppid, 'exe': _exe, 'created': _cd})
     except Exception as e:
         out.append({'error': repr(e)[:160]})
     return out
@@ -374,9 +386,17 @@ def main():
         except Exception as e:
             P('写文件失败: %r' % e)
 
+    # P3-NB4(2026-10-29 修复)：退出码语义与文件头文档对齐。
+    #   文档: 0=健康 1=发现多实例(高危) 2=行情服务器普遍超时 3=两者都有
+    #   原实现 `return 3 if dead_hosts else 1`：多实例 + 任意 1 台主机超时(远未到
+    #   「普遍超时」的 len-1 门槛) 就报 3，自动化脚本按 3 判断「行情也挂了」会误判。
+    #   现要求「多实例」与「普遍超时」同时成立才返回 3。
+    _hosts_down = dead_hosts >= max(1, len(QMT_HOSTS) - 1)
+    if multi and _hosts_down:
+        return 3
     if multi:
-        return 3 if dead_hosts else 1
-    if dead_hosts >= len(QMT_HOSTS) - 1:
+        return 1
+    if _hosts_down:
         return 2
     return 0
 

@@ -1866,10 +1866,10 @@ PARAMS = {
     # 但 symbols_config 预留的低流动性标的扩容时防止单笔订单占当日成交量显著比例
     # （滑点与冲击成本失控）。数据源为已缓存的 y_vols，无额外行情开销。
     "max_participation_pct": 0.01,
-    # P2-2 修复(2026-10-01)：价格健全性断言阈值——最近已收盘 bar 收盘价与实时价偏差
-    # 超过该比例判数据异常（可捕获复权口径错配/停牌残留价/脏数据），本根 bar 跳过交易。
-    # 暴跌日个股单日振幅极少超过 10%，该阈值不会误伤正常行情。
-    "hist_price_sanity_pct": 0.10,
+    # P3-NI-7(2026-10-29 修复)：原 "hist_price_sanity_pct": 0.10 是一个【从未被读取】的
+    #   死键——实际价格健全性检查走的是 L8835 起的涨跌停区间 + _limit_ratio_by_code
+    #   板块幅度（主板10%/创科20%/北交30%/ST5%），比固定 10% 更准确。留着一个不生效
+    #   的阈值只会误导排查，故删除；如需固定百分比口径，请改 _limit_ratio_by_code。
 }
 
 # 盘中阶梯加仓（M3）：相对当日开盘价的盘中实时跌幅，独立于 DCA 金字塔
@@ -2147,7 +2147,13 @@ _LOG_KEY_ALWAYS = (       # 关键交易事件白名单：包含以下子串的�
     # AUD36(2026-10-08 第四轮零预设独立审计)：补入「【卖出】」——原白名单有买入无卖出，
     # 300 秒内两条文案相同的卖出日志第二条会被去重吞掉；卖出是铁律最关键的证据链，禁止被吞。
     "【买入】", "【卖出】", "【首仓", "【止盈平仓】", "【涨停卖出】",
-    "【警告】", "已发委托", "已成", "已委托",)
+    "【警告】", "已发委托", "已成", "已委托",
+    # P3-NI-8(2026-10-29 修复)：补入本轮新增/改写的关键成交证据链文案——
+    #   这些日志一旦被 300 秒去重吞掉，事后就无法还原「卖了没、卖了多少」。
+    "【卖出账本结算", "手工仓(你手动买的仓位)触发卖出",
+    "【手工清仓记账】", "【手工减仓记账】", "【卖出在途恢复】",
+    "【手工卖单在途解除", "【手工卖单在途告警】", "【双实例拦截】",
+    "【单实例锁", "【卖出在途告警】",)
 _LOG_WRITE_MODE = ""      # 日志实测可用的写模式："run-handle" / "append" / "overwrite" / ""
 _IO_CAPS = {}             # IO 能力探测缓存（见 _io_probe）
 _LOG_FP = None            # 本次运行的日志文件句柄（常开）
@@ -6945,7 +6951,15 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
     _ss = state.get("sell_pending_snapshot")
     if isinstance(_ss, dict):
         _before_total = int(_ss.get("position_shares", 0) or 0) + int(_ss.get("manual_shares", 0) or 0)
-        _sold = max(0, min(int(_ss.get("vol", 0) or 0), _before_total - int(actual_vol or 0)))
+        _sold_raw = max(0, min(int(_ss.get("vol", 0) or 0), _before_total - int(actual_vol or 0)))
+        # P3-PNL(2026-10-29 修复)：同一快照会被反复进入(卖单部分成交后余量撤单、券商持仓迟迟
+        #   未降到清空条件时)，原实现每轮都按 _sold 重新记账一次 —— 报告实测一笔部分成交被
+        #   记了 10 次，盈亏与胜率全被放大。现由快照自身记录「已结算股数 booked」，
+        #   每轮只结算新增的那部分(_sold_raw - booked)，彻底幂等。
+        _sold_booked = int(_ss.get("booked", 0) or 0)
+        _sold = max(0, _sold_raw - _sold_booked)
+        if _sold_raw > _sold_booked:
+            _ss["booked"] = _sold_raw
         if _sold > 0:
             # P1-2(2026-10-29 修复)：卖出必须真正扣减【策略账本】，
             #   原实现只记盈亏(_pnl_record_close)和手工仓，position_shares / total_cost /
@@ -6973,9 +6987,10 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
                     state["last_add_price"] = 0.0
                 else:
                     state["last_add_price"] = state["total_cost"] / _ps_after_p12
-                log("[%s] 【卖出账本结算(P1-2)】卖出%d股(其中策略仓%d股/手工仓%d股)；"
+                log("[%s] 【卖出账本结算(P1-2)】本轮新增卖出%d股(累计%d/%d股, 其中策略仓%d股/手工仓%d股)；"
                     "策略持仓 %d->%d 股，成本扣减%.2f元，剩余额度%.2f元"
-                    % (code, _sold, _sold_strat_p12, _sold_manual_p12,
+                    % (code, _sold, _sold_raw, int(_ss.get("vol", 0) or 0),
+                       _sold_strat_p12, _sold_manual_p12,
                        _ps_before_p12, _ps_after_p12, _cost_out_p12,
                        float(state.get("deployed", 0.0) or 0.0)))
             if _ss.get("allow_manual"):
@@ -6993,9 +7008,36 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
             else:
                 _snap = dict(state); _snap["position_shares"] = int(_ss.get("position_shares", 0) or 0); _snap["total_cost"] = float(_ss.get("total_cost", 0.0) or 0.0)
                 _pnl_record_close(code, _sold, float(_ss.get("price", price) or price), _snap)
-        if _sold >= int(_ss.get("vol", 0) or 0) or int(actual_vol or 0) >= _before_total:
+        if _sold_raw >= int(_ss.get("vol", 0) or 0) or int(actual_vol or 0) >= _before_total:
             state["sell_pending_snapshot"] = None
             state["manual_sell_snapshot"] = None
+
+    # P3-NI-6(2026-10-29 修复)：手工卖单冻结窗口原本只写不读——manual_sell 卖出成功后会置
+    #   manual_sell_pending_until，但全文件没有任何解冻点，窗口一旦置上就永久有效，
+    #   此后该标的再也无法手工代卖（manual_sell 入口直接 return False），形同废掉一条腿。
+    #   现与策略卖单同口径：窗口过期+委托确认无活跃卖单 -> 解冻；查询不可用达3次 -> 解冻。
+    _mspu = float(state.get("manual_sell_pending_until", 0.0) or 0.0)
+    if _mspu > 0 and _mspu <= time.time():
+        _msok, _msany, _msdetail = _sell_order_status(acct, code)
+        if _msok and not _msany:
+            state["manual_sell_pending_until"] = 0.0
+            state["manual_sell_snapshot"] = None
+            log("[%s] 【手工卖单在途解除】冻结窗口已过期且委托确认无活跃卖单(%s)，"
+                "手工仓恢复可评估(满足阈值时会重新挂单)" % (_cn(code), _msdetail))
+        elif _msok and _msany:
+            state["manual_sell_pending_until"] = time.time() + _SELL_PENDING_TTL
+            log("[%s] 【手工卖单在途告警】窗口已过期但仍有活跃卖单(%s)，延长冻结%d秒"
+                % (_cn(code), _msdetail, int(_SELL_PENDING_TTL)))
+        else:
+            _mfq = _SELL_PEND_QUERY_FAIL.get("M:" + code, 0) + 1
+            _SELL_PEND_QUERY_FAIL["M:" + code] = _mfq
+            if _mfq >= 3:
+                state["manual_sell_pending_until"] = 0.0
+                state["manual_sell_snapshot"] = None
+                log("[%s] 【手工卖单在途解除-查询不可用兜底】连续%d次查询失败，已解冻"
+                    % (_cn(code), _mfq))
+            else:
+                state["manual_sell_pending_until"] = time.time() + _SELL_PENDING_TTL
 
     _own_sell_pending = (_spu > time.time())   # 自身卖出在途：不记账（sell_all 已记）
     if actual_vol > 0 and _spu > 0:
@@ -8767,6 +8809,18 @@ def _handlebar_impl(C, code, cfg, params, state):
     hist4 = fetch_hist_fields(C, code, params)
     if hist4 is None:
         # N13：历史指标缺失不应堵死唯一退出通道；止盈只依赖状态和当前价格。
+        # P3-N13(2026-10-29 修复)：止盈放行不等于可以绕过卖出侧的全部前置约束——
+        #   原实现直接 sell_all，跳过了 in_cooldown / limit_sell_date / 卖出在途等闸门，
+        #   在 manual_takeover 场景下可能同日反复触发同类卖出。现补最小必要护栏：
+        #   ① 卖出冷却期内不再卖（与主路径 in_cooldown 同口径）；
+        #   ② 当日已因涨停卖出过则跳过（与主路径 limit_sell_date 同口径）。
+        _today13 = datetime.now().strftime("%Y-%m-%d")
+        if in_cooldown(state):
+            _note_entry_block(code, "N13历史缺失止盈-卖出冷却期内")
+            return
+        if state.get("limit_sell_date", "") == _today13:
+            _note_entry_block(code, "N13历史缺失止盈-当日涨停卖出过")
+            return
         _tp13, _why13 = should_take_profit(state, price, params)
         if _tp13 and sell_all(C, code, acct, price, _why13, state):
             save_state(code, state)
@@ -9123,6 +9177,18 @@ def _handlebar_impl(C, code, cfg, params, state):
 
     # S1 修复：止盈置于熔断暂停检查之前（熔断暂停期间仍放行止盈；止盈全平是唯一合法自动解除熔断路径）
     # ---- 止盈：固定+移动止盈 ----
+    # P3-NI-6(2026-10-29 修复)：止盈必须有「卖出已在途」的短路。
+    #   原实现只在 sell_all 返回 True 之后才写 sell_pending_until(L9155)，若卖单被柜台拒、
+    #   或仅部分成交后剩余撤单，下一根 bar 仍判定「该止盈」，于是反复重发卖单 ——
+    #   报告实测：4 根 bar 连发 4 笔卖单，每笔都要付一次 5 元最低佣金。
+    #   现若上一笔卖单仍在冻结窗口内，本轮直接跳过止盈（等它成交或超时结算）。
+    _spu_tp = float(state.get("sell_pending_until", 0.0) or 0.0)
+    if _spu_tp > time.time():
+        if _diag_due(code):
+            log("[%s] 止盈判定跳过：上笔卖单仍在途(冻结至 %s)，等成交/超时结算后再评估"
+                % (code, time.strftime("%H:%M:%S", time.localtime(_spu_tp))))
+        save_state(code, state)
+        return
     tp_ok, tp_reason = should_take_profit(state, price, params)
     if tp_ok:
         if not can_sell:

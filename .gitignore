@@ -1,4 +1,65 @@
+# ---- Python ----
 __pycache__/
 *.py[cod]
 *.pyc
+*.pyd
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- 编辑器 / 系统 ----
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- 运行期产物（策略会在自身目录写约 30 个状态文件，绝不入库）----
+# 日志
+*.log
+*.log.*
+zt_shrink_daily_task.log
+zt_shrink_daily_task_runner.log
+gf_native_trade.log*
+
+# 状态 / 台账 / 在途
+*state*.json
+*_state.json
+*pending*.json
+*heartbeat*
+*.lock
+*.tmp
+*.prev
+gf_native_multi_*.json
+gf_native_pending.json
+gf_pnl_history.json
+gf_native_pnl*.csv
+zt_shrink_gen_*.json
+
+# 行情 / 日历缓存（体积大且每日变动）
+trading_calendar.json
+trading_calendar.json.extbak.*
+zt_shrink_st_hist*.json
+zt_shrink_blacklist*.json
+zt_shrink_risk_exclude*.json
+
+# 备份与修补残留
+*.bak
+*.bak.*
+*.bak_*
+*_bak_*
+*.orig
+*.rej
+*~
+
+# ---- 本机私有配置（绝不入库）----
+gf_fixed_dir.txt
+settings.json
+local_config*.json
+*.secret
+*.pem
+*.key
+
+# ---- 临时调试输出 ----
+_out*.txt
+_dump*.txt
+_dry*.txt
+*.err

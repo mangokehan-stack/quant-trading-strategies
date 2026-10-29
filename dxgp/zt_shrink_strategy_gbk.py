@@ -1626,6 +1626,36 @@ def startup_selftest():
                 % ('; '.join(_const_bad)))
         else:
             log('[启动自检] 关键运行期常量内容核对通过(TRAP_TAG/BUY_BLOCK_TAG/ORDER_STATUS_MAP/PHASE_NAME)')
+        # P3-X-N3(2026-10-29 修复)：上面的常量自检是「拿文件里的字面量和同一文件的常量比」，
+        #   整个文件被替换/转码乱码时两边一起变，等于恒等于真，抓不到「整文件被 mangle」。
+        #   这里改为对【源文件本身】做只读体检：统计 U+FFFD（替换字符）个数与中文占比，
+        #   两者异常即判文件编码被破坏（GBK 文件被误存成 UTF-8、或编辑器另存乱码）。
+        try:
+            _sf2 = globals().get('__file__')
+            if _sf2 and os.path.exists(_sf2):
+                with open(_sf2, 'rb') as _fh2:
+                    _raw2 = _fh2.read()
+                _src2 = None
+                for _enc2 in ('gbk', 'utf-8'):
+                    try:
+                        _src2 = _raw2.decode(_enc2)
+                        break
+                    except Exception:
+                        continue
+                if _src2 is None:
+                    log('[启动自检][严重] 源文件既非 GBK 也非 UTF-8 可解码 —— 文件可能已损坏，请用备份恢复')
+                else:
+                    _n_fffd = _src2.count('\ufffd')
+                    _n_cjk = sum(1 for _ch in _src2[:200000] if '\u4e00' <= _ch <= '\u9fff')
+                    if _n_fffd > 0:
+                        log('[启动自检][严重] 源文件存在 %d 个 U+FFFD 替换字符 —— 编码已被破坏，'
+                            '请用 .bak 备份恢复（常见原因：GBK 文件被另存为 UTF-8）' % _n_fffd)
+                    elif _n_cjk < 200:
+                        log('[启动自检][严重] 源文件前 20 万字符中文仅 %d 个 —— 疑似整文件被乱码替换' % _n_cjk)
+                    else:
+                        log('[启动自检] 源文件编码体检通过(U+FFFD=0, 中文样本=%d)' % _n_cjk)
+        except Exception as _e_xn3:
+            log('[启动自检] 源文件编码体检跳过(%s)' % _e_xn3)
     except Exception:
         traceback.print_exc()
 
@@ -1780,6 +1810,12 @@ def _disk_adjust_daily_buy(delta, code=''):
 def save_state(critical=False):
     """原子写状态文件。返回是否成功；交易意图等关键保存失败时立即禁止发单。"""
     with G.state_lock:         # 审计修复3: 状态写入加锁, 防止回调并发竞态
+        # P3-D1(2026-10-29 修复)：主文件损坏且隔离失败时, 禁止覆盖主文件。
+        #   此时主文件是唯一的现场证据, 一旦被备份内容盖掉, 事后完全无法复核
+        #   「到底是哪个字段坏、坏在哪」。冻结交易已由 state_broken_lock 承担,
+        #   这里只做「不写」, 不影响任何交易判定。
+        if getattr(G, 'state_no_overwrite', False):
+            return False
         try:
             p = state_path()
             if STATE_BAK_KEEP > 0 and G.today and G.state_bak_date != G.today:
@@ -2024,6 +2060,15 @@ def load_state():
                 _broken_main = _quarantine_broken_state(state_path())
                 G.state_broken = True
                 G.state_broken_lock = True
+                # P3-D1(2026-10-29 修复)：隔离失败时绝不覆盖主文件。
+                #   原实现即使 _quarantine_broken_state 返回 ''（os.replace 被共享锁/杀软拒绝）
+                #   也照样往下走，随后 save_state 会拿备份内容把这份【坏但仍是唯一证据】的
+                #   主文件盖掉；重启后连现场都没了，日志里那句「已永久冻结，需人工核对」
+                #   也就无从核对。现置 _STATE_NO_OVERWRITE 标志，由 save_state 跳过写主文件。
+                if not _broken_main:
+                    G.state_no_overwrite = True
+                    log('[安全][告警] 主文件隔离失败(可能被杀软/共享锁占用)，'
+                        '已禁止后续保存覆盖主文件，保留现场供人工取证: %s' % state_path())
                 log('[安全][告警] 状态主文件不可读, 已回滚装载备份: %s | 主文件隔离=%s | '
                     '交易永久冻结, 需人工核对券商持仓与状态后重启'
                     % (cand, _broken_main or '失败/原文件不存在'))
@@ -6639,11 +6684,14 @@ def prescreen_offday():
             G.universe = load_universe()
         except Exception:
             pass
-    if not G.hist:
-        try:
-            load_history()
-        except Exception:
-            pass
+    # P3-X-N1(2026-10-29 修复)：非交易日预选必须【每次重载】日线。
+    #   原实现只在 G.hist 为空时才 load_history()；周末 QMT 保持登录时 G.hist 还是上一个
+    #   交易日的旧切片，于是直接拿旧数据选股 —— 正是 V2.6.180 声称修掉的「陈旧基准」。
+    #   旧池会写进日志并下发到 QMT 板块，盘前看到的是过期名单。
+    try:
+        load_history()
+    except Exception as _e_xn1:
+        log('[非交易日预选] 日线重载异常(继续用现有缓存):', _e_xn1)
     if not G.hist:
         log('[非交易日预选] 本地无日线数据(QMT数据目录未下载或行情未连接), 本次预选跳过; '
             '候选池将在下一个交易日初始化时自动构建')
@@ -9584,10 +9632,27 @@ def pyramid_add(s, h, lp, vol, batch_idx, batch_total, reason, tick=None):
     _la168 = abs_cap_left(px)
     if _la168 is not None:
         _amts_a168.append(max(0.0, _f(_la168) * _f(px)))
-    vol = cap_fit_volume(s, vol, px, None, _amts_a168, '分批加仓')
+    # P3-C-N3(2026-10-29 修复)：按标的真实最小申报单位裁量。
+    #   原实现 lot 传 None -> cap_fit_volume 退回默认 100 股步长，科创板(688/689)首笔
+    #   至少 200 股，裁剪后可能算出 100 股这种非法数量，发出必被柜台拒的委托，
+    #   还白白消耗重试次数与当日买入机会。
+    _lot_a168 = _lot_of(s)
+    vol = cap_fit_volume(s, vol, px, _lot_a168, _amts_a168, '分批加仓')
+    if vol > 0:
+        try:
+            vol = normalize_buy_volume(s, vol)   # 二次规范化，确保满足板块申报规则
+        except Exception:
+            pass
     if vol <= 0:
-        log(disp(s), '分批加仓被拦下: 委托价%.2f元下, 实际买入会顶穿单票/组合额度' % _f(px))
+        log(disp(s), '分批加仓被拦下: 委托价%.2f元下, 实际买入会顶穿单票/组合额度或不足最小申报量' % _f(px))
         return 0.0
+    # P3-C-N3：科创板当日已被拒过单的标的直接跳过加仓，防整日反复废单
+    try:
+        if is_kcb_code(s) and (G.kcb_reject_date or {}).get(s) == G.today:
+            log(disp(s), '科创板当日已被柜台拒单，分批加仓跳过(防重复废单)')
+            return 0.0
+    except Exception:
+        pass
     if DRY_RUN:          # 审计修复I7: 模拟盘不真发单, 构造成交回报走deal_callback记账
         h['pend_vol'] = int(vol)
         h['order_ts'] = time.time()
@@ -9714,6 +9779,12 @@ def run_pyramid_adds(ticks, cash, ords_snap=None):
             continue                                  # 老状态/一次性建仓的票: 不补买
         if h.get('exited'):
             continue
+        # P3-C-N5(2026-10-29 修复)：正在卖出/放弃卖出的标的绝不能再续买。
+        #   原实现只挡 exited，卖单在途或 sell_giveup 期间仍会走加仓通道 ——
+        #   报告实测：卖出后又在同一天把票买回来，绕过 REBUY_GAP 与当日买入上限。
+        if h.get('sell_giveup') or (G.state.get('sell_ctx') or {}).get(s) \
+                or _f(h.get('sell_ts', 0.0)) > 0:
+            continue                                  # 卖出流程中: 不再加仓
         if is_handoff(h):
             continue                                  # 已移交人工: 不再续买后续批次
         if int(_f(h.get('fill_vol', 0) or 0)) <= 0:
@@ -10474,8 +10545,18 @@ def buy_stock(c, lp, est, ratio, cash, want_vol=None, atr=0.0, atr_pct=0.0, stop
         # passorder: 23=股票买, 1101=按股, 11=限价, quickTrade=2立即下单, 备注BUY|代码
         log('[应急闸门][通过] 新开仓 | %s | mode=%s | %d股'
             % (disp_code(s, c.get('name', '')), emergency_mode_effective(), vol))
-        _api(passorder, 23, 1101, G.accid, s, 11, px, vol,
+        _ret_new = _api(passorder, 23, 1101, G.accid, s, 11, px, vol,
                   STRAT_TAG, 2, 'BUY|' + s + '|NEW', G.C)   # 重审20261006(P0-B/问题2): 新建仓单加|NEW后缀区分加仓
+        # P3-C-N7(2026-10-29 修复)：passorder 返回失败(-1/None)时不得计入买入笔数。
+        #   原实现无条件 G.buy_cnt += 1，委托实际被柜台静默拒绝时，当日买入统计
+        #   与「已发单笔数」都会虚高，事后核对成交记录对不上；且真正的失败
+        #   既不重报也不给明确信号（僵尸占位一直挂到超时）。
+        if _ret_new is None or (isinstance(_ret_new, (int, float)) and _ret_new < 0):
+            log('[安全] %s 买入未成功发出(passorder 返回 %r)，不计入买入笔数，本次放弃'
+                % (disp(s), _ret_new))
+            _safe_rollback_placeholder(s)
+            save_state()
+            return None
         G.buy_cnt += 1
         _add_to_sector(s)
         # P1-3: 买入上下文兜底 —— 成交回报晚于持仓记录被清理时, 回报可凭此补录建仓
@@ -10931,6 +11012,13 @@ def handle_unfilled_sell(s, h, pos_avail, lp, tick=None, ords_snap=None):
                 # P1-4: giveup必须复位exited —— 否则该仓永久停留在"卖出在途"态:
                 # 名额被永久释放、盈亏快照跳过、常规卖出判定永不评估(止盈纪律失效)
                 h['exited'] = False
+                # P3-C-N4(2026-10-29 修复)：策略放弃自动卖出后必须清掉 sell_ctx，
+                #   否则 deal_callback 的四重判据里 `not sell_ctx.get(code)` 恒不成立，
+                #   用户在券商端手工卖出的成交永远不会被识别入账 -> 幽灵持仓占着名额与额度。
+                try:
+                    (G.state.get('sell_ctx') or {}).pop(s, None)
+                except Exception:
+                    pass
                 save_state()
             if h.get('sell_note_date') != G.today:
                 h['sell_note_date'] = G.today
@@ -11013,6 +11101,12 @@ def handle_unfilled_sell(s, h, pos_avail, lp, tick=None, ords_snap=None):
             # P1-4: giveup必须复位exited(见拒单分支注释): 名额/盈亏口径恢复计入该仓,
             # 常规卖出判定恢复评估(次日sell_giveup由新一轮卖出决策自动复位)
             h['exited'] = False
+            # P3-C-N4(2026-10-29 修复)：同拒单分支——放弃自动卖出即清 sell_ctx，
+            #   让后续用户手工卖出能被四重判据正常识别入账。
+            try:
+                (G.state.get('sell_ctx') or {}).pop(s, None)
+            except Exception:
+                pass
             save_state()
         if h.get('sell_note_date') != G.today:
             h['sell_note_date'] = G.today
@@ -11281,12 +11375,18 @@ def handle_unfilled_buy(s, h, ords_snap=None):
     _cash6 = eff_cash(_cash6)
     _lot6 = 1 if is_kcb_code(s) else (int(LOT_SIZE) if LOT_SIZE > 0 else 100)
     _caps6 = [int(pend)]
+    # P3-C-N1(2026-10-29 修复)：重报额度必须【剔除本单自身占用的额度】。
+    #   原实现直接用 MAX_POS_VALUE_ABS - pos_cost(h) 与 abs_cap_left(px)，而 used_capital()
+    #   已把当前这笔在途买单的成本算在内 —— 同一笔钱被扣两次，重报数量被削到很小甚至
+    #   不足一手而放弃，单批首单因此变成僵尸单（占着名额与额度一整天，既不成交也不释放）。
+    #   这里按本单剩余量估算自身占用并从可用额度中加回，仅影响重报数量，不改任何闸门口径。
+    _self_occ6 = _f(px) * _f(max(0, int(pend)))
     if MAX_POS_VALUE_ABS and MAX_POS_VALUE_ABS > 0:
-        _remain_one6 = max(0.0, MAX_POS_VALUE_ABS - pos_cost(h))
-        _caps6.append(int(_remain_one6 / px))
+        _remain_one6 = max(0.0, MAX_POS_VALUE_ABS - _f(pos_cost(h)) + _self_occ6)
+        _caps6.append(int(_remain_one6 / px) if px > 0 else 0)
     _left6 = abs_cap_left(px)
     if _left6 is not None:
-        _caps6.append(int(_left6))
+        _caps6.append(int((_f(_left6) + _self_occ6) / px) if px > 0 else 0)
     _cash_vol6 = 0
     if px > 0:
         _cash_vol6 = int(_cash6 / px)
@@ -11310,6 +11410,14 @@ def handle_unfilled_buy(s, h, ords_snap=None):
         return
     if limit_gate_reject(s, px, True, '买入重报'):
         return
+    # P3-C-N6(2026-10-29 修复)：对端实例检查必须【前移到计数自增之前】。
+    #   原实现在 h['order_retries'] = retries + 1 之后才判断 _live_peer_exists()，
+    #   检查不通过直接 return —— 但重试次数已经 +1 了。对端实例存活期间每根 bar
+    #   都白耗一次，几轮就把 BUY_ORDER_RETRIES 耗尽，本实例恢复后已无重报机会。
+    #   现先判对端，再动计数。
+    if (not DRY_RUN) and _live_peer_exists():
+        log('[安全][P1-2] 检测到存活的其它策略实例, 本轮回避买入重报(防重复下单, 不消耗重试次数)')
+        return
     h['order_retries'] = retries + 1
     h['order_ts'] = time.time()
     h['pend_vol'] = int(pend)
@@ -11330,10 +11438,7 @@ def handle_unfilled_buy(s, h, ords_snap=None):
                 log(disp(s), '[模拟盘] 买入委托重报未成交(成交概率%.0f%%), 下轮重试'
                     % (SIM_FILL_PROB * 100))
         else:
-            # P1-2(第18轮审计): 买入重报也是买入动作, 与新建买入同口径纳入双实例防护
-            if _live_peer_exists():
-                log('[安全][P1-2] 检测到存活的其它策略实例, 本轮回避买入重报(防重复下单)')
-                return
+            # P3-C-N6：对端实例检查已前移到计数自增之前，此处不再重复判断
             log('[应急闸门][通过] 买入重报 | %s | mode=%s | %d股'
                 % (disp(s), emergency_mode_effective(), int(pend)))
             _api(passorder, 23, 1101, G.accid, s, 11, px, int(pend),
@@ -11476,48 +11581,59 @@ def run_round(sent_parsing=False):
                           log('[单位校准][拉闸][告警] tick量单位异常持续(第%d天): 买入保持暂停, '
                               '等待人工确认行情源正常(TICK_UNIT_ACK=True或状态文件tick_unit_ack)' % (_bad,))
                   else:
-                      # P3-7(2026-10-24 第18轮零预设独立审计): "核对不了"必须与"核对通过"区分开。
-                      #   旧版探测失败(样本不足/接口异常)只打一行提示, 不计入 tick_unit_bad_days,
-                      #   于是行情源真换成"股"口径且样本长期不足时, 量能信号会静默错100倍:
-                      #     * MIN_DAILY_AMOUNT 成交额 = 收盘x量x100 虚高100倍 -> 1000万流动性
-                      #       门槛形同虚设(垃圾股全放行);
-                      #     * 换手率 = 量x100/流通股本 虚高100倍 -> 全部 >20% 被 ZT_TURNOVER_MAX
-                      #       误杀(正常票全被剔)。
-                      #   两侧方向相反、净效应不确定, 属最危险的"静默跑偏"形态。
-                      #   现按同一阈值计入连续异常天数, 满 TICK_UNIT_BLOCK_DAYS 天同样拉闸停买,
-                      #   仅日志措辞与"判定为股"区分(不把取不到数据说成数据错了)。
-                      _bad = 0
-                      _need_save = False
-                      _just_blocked = False
-                      with G.state_lock:
-                          _bad_day = G.state.get('tick_unit_bad_date')
-                          _bad = int(G.state.get('tick_unit_bad_days', 0) or 0)
-                          if _bad_day != G.today:
-                              _bad += 1
-                              G.state['tick_unit_bad_date'] = G.today
-                              G.state['tick_unit_bad_days'] = _bad
-                              _need_save = True
-                          if _bad >= TICK_UNIT_BLOCK_DAYS and not G.state.get('tick_unit_blocked'):
-                              G.state['tick_unit_blocked'] = True
-                              G.state['tick_unit_ack'] = ''
-                              _need_save = True
-                              _just_blocked = True
-                      if _need_save:
-                          save_state()
-                      if _just_blocked:
-                          log('[单位校准][拉闸][告警] tick量单位连续%d个交易日无法核对(样本不足/接口异常): '
-                              '已强制暂停全部买入(主买入/分批加仓均拦截) —— 请人工检查行情源, 确认正常后: '
-                              '①置 TICK_UNIT_ACK=True, 或 ②在状态文件写 "tick_unit_ack":"<确认日期>"'
-                              % (_bad,))
-                      elif _bad < TICK_UNIT_BLOCK_DAYS:
-                          log('[单位校准][告警] tick快照volume核对样本不足(无法核对口径): 按已确认口径=手处理; '
-                              '异常第%d/%d天, 连续满%d天将强制暂停买入'
-                              % (_bad, TICK_UNIT_BLOCK_DAYS, TICK_UNIT_BLOCK_DAYS))
-                      else:
-                          log('[单位校准][拉闸][告警] tick量单位持续无法核对(第%d天): 买入保持暂停, '
-                              '等待人工确认行情源正常(TICK_UNIT_ACK=True或状态文件tick_unit_ack)' % (_bad,))
-                      if getattr(G, 'tick_unit_warn_date', '') != G.today:
-                          G.tick_unit_warn_date = G.today
+                       # P3-X-N2(2026-10-29 修复)：观察池本身不足 3 只时, 样本永远凑不满,
+                       #   这不是「行情源可疑」而是「压根没样本」。原实现无条件计入异常天数,
+                       #   持仓+候选只有 1~2 只的组合连续 TICK_UNIT_BLOCK_DAYS 天就被拉闸停买。
+                       #   现按只数短路: 样本先天不足不计入异常天数, 也不触发拉闸。
+                       _watch_n_xn2 = len(watch or [])
+                       if _watch_n_xn2 < TICK_UNIT_MIN_SAMPLES:
+                           if getattr(G, 'tick_unit_skip_logged', '') != (G.today + '|few'):
+                               G.tick_unit_skip_logged = G.today + '|few'
+                               log('[单位校准] 观察池仅%d只(<%d), 样本先天不足, 本次不核对也不计入异常天数'
+                                   % (_watch_n_xn2, TICK_UNIT_MIN_SAMPLES))
+                       else:
+                          # P3-7(2026-10-24 第18轮零预设独立审计): "核对不了"必须与"核对通过"区分开。
+                          #   旧版探测失败(样本不足/接口异常)只打一行提示, 不计入 tick_unit_bad_days,
+                          #   于是行情源真换成"股"口径且样本长期不足时, 量能信号会静默错100倍:
+                          #     * MIN_DAILY_AMOUNT 成交额 = 收盘x量x100 虚高100倍 -> 1000万流动性
+                          #       门槛形同虚设(垃圾股全放行);
+                          #     * 换手率 = 量x100/流通股本 虚高100倍 -> 全部 >20% 被 ZT_TURNOVER_MAX
+                          #       误杀(正常票全被剔)。
+                          #   两侧方向相反、净效应不确定, 属最危险的"静默跑偏"形态。
+                          #   现按同一阈值计入连续异常天数, 满 TICK_UNIT_BLOCK_DAYS 天同样拉闸停买,
+                          #   仅日志措辞与"判定为股"区分(不把取不到数据说成数据错了)。
+                          _bad = 0
+                          _need_save = False
+                          _just_blocked = False
+                          with G.state_lock:
+                              _bad_day = G.state.get('tick_unit_bad_date')
+                              _bad = int(G.state.get('tick_unit_bad_days', 0) or 0)
+                              if _bad_day != G.today:
+                                  _bad += 1
+                                  G.state['tick_unit_bad_date'] = G.today
+                                  G.state['tick_unit_bad_days'] = _bad
+                                  _need_save = True
+                              if _bad >= TICK_UNIT_BLOCK_DAYS and not G.state.get('tick_unit_blocked'):
+                                  G.state['tick_unit_blocked'] = True
+                                  G.state['tick_unit_ack'] = ''
+                                  _need_save = True
+                                  _just_blocked = True
+                          if _need_save:
+                              save_state()
+                          if _just_blocked:
+                              log('[单位校准][拉闸][告警] tick量单位连续%d个交易日无法核对(样本不足/接口异常): '
+                                  '已强制暂停全部买入(主买入/分批加仓均拦截) —— 请人工检查行情源, 确认正常后: '
+                                  '①置 TICK_UNIT_ACK=True, 或 ②在状态文件写 "tick_unit_ack":"<确认日期>"'
+                                  % (_bad,))
+                          elif _bad < TICK_UNIT_BLOCK_DAYS:
+                              log('[单位校准][告警] tick快照volume核对样本不足(无法核对口径): 按已确认口径=手处理; '
+                                  '异常第%d/%d天, 连续满%d天将强制暂停买入'
+                                  % (_bad, TICK_UNIT_BLOCK_DAYS, TICK_UNIT_BLOCK_DAYS))
+                          else:
+                              log('[单位校准][拉闸][告警] tick量单位持续无法核对(第%d天): 买入保持暂停, '
+                                  '等待人工确认行情源正常(TICK_UNIT_ACK=True或状态文件tick_unit_ack)' % (_bad,))
+                          if getattr(G, 'tick_unit_warn_date', '') != G.today:
+                              G.tick_unit_warn_date = G.today
                 except Exception:
                   G.tick_vol_unit = 1 if _forced == 1 else 100
     except Exception:
@@ -12756,6 +12872,17 @@ def orderError_callback(ContextInfo, orderArgs, errMsg):
                 b['codes'].remove(code)
             _disk_adjust_daily_buy(-1, code)   # 同步修正磁盘计数(防合并逻辑把退额改回)
             log('[安全][D3] 科创板买单被拒，已将%s屏蔽至当日结束，防每轮重复废单(已退回当日买入额度)' % disp(code))
+            # P3-C-N2(2026-10-29 修复)：科创板分支已退过一次当日额度，必须在此结束。
+            #   原实现继续往下走到通用买入废单分支(L12738)，又退一次 —— 报告实测
+            #   拒单后当日额度从 3 变 1（应只变 2），等于白丢一个买入机会；
+            #   减持/重报路径同理。此处直接清理持仓记录并返回，避免双重退额。
+            _hk = G.state['hold'].get(code)
+            if _hk and _hk.get('fill_vol', 0) <= 0:
+                del G.state['hold'][code]
+                G.state['done'].pop(code, None)
+            G.buy_cnt = max(0, G.buy_cnt - 1)
+            save_state()
+            return
         if err_oid and current_oid and not matched:
             log('[安全] 忽略迟到的旧委托错误回调: 当前OrderID=%s 回调OrderID=%s' % (current_oid, err_oid))
             return

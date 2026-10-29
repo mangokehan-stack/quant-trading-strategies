@@ -23,7 +23,7 @@ set_daily_buys.py —— 外部禁买/买入计数工具 (GBK 母版 zt_shrink_s
 【与母版的对接契约(全部从 V2.6.81 代码提取, 逐字一致)】
   1) 目标文件 = 母版 state_path() 同名文件: 策略同目录的
      zt_shrink_state_<账号后缀>.json (后缀与 zt_shrink_st_hist_*.json 一致,
-     例如 zt_shrink_state_账号后缀.json); 无后缀时为 zt_shrink_state.json
+     例如 zt_shrink_state_<acct>.json); 无后缀时为 zt_shrink_state.json
   2) 文件编码 = UTF-8 (母版 L1044/L1228 明确: 外部工具以 UTF-8 写入中文标记)
   3) 数据结构 = {"buys": {"live": {"date":"YYYYMMDD","n":int,"codes":[...]},
                           "paper": {...}}, ...其余键原样保留...}
@@ -75,15 +75,15 @@ def _today_str():
 def infer_account_suffix(base_dir):
     """从同目录兄弟数据文件推断母版 _account_suffix() 的返回值。
     依据: st_hist_path()/blacklist_path() 与 state_path() 用同一套后缀规则,
-    磁盘上的 zt_shrink_st_hist_账号后缀.json / zt_shrink_blacklist_账号后缀.json
-    即证明运行时后缀为 _账号后缀。优先返回非 _dry 后缀(母版 DRY_RUN=False)。"""
+    磁盘上的 zt_shrink_st_hist_<acct>.json / zt_shrink_blacklist_<acct>.json
+    即证明运行时后缀为 _<acct>。优先返回非 _dry 后缀(母版 DRY_RUN=False)。"""
     cands = []
     for base in ('zt_shrink_st_hist', 'zt_shrink_blacklist'):
         for p in glob.glob(os.path.join(base_dir, base + '_*.json')):
             n = os.path.basename(p)
             if '.bak.' in n or '.extbak.' in n or n.endswith('.tmp'):
                 continue
-            suf = n[len(base):-len('.json')]      # 含前导下划线: _账号后缀 / _noid / _账号后缀_dry
+            suf = n[len(base):-len('.json')]      # 含前导下划线: _<acct> / _noid / _<acct>_dry
             if suf:
                 cands.append(suf)
     uniq = sorted(set(cands))
@@ -209,7 +209,7 @@ def main(argv=None):
     ap.add_argument('--paper', action='store_true',
                     help='操作 paper(模拟)桶; 不加则操作 live(实盘)桶')
     ap.add_argument('--date', default='',
-                    help='操作日期 YYYYMMDD, 默认今天; 填未来日期可预先封锁')
+                    help='操作日期 YYYYMMDD, 默认且仅支持今天(未来日期会被覆盖, 已拒绝); SHOW 可查历史')
     ap.add_argument('--state', default='',
                     help='显式指定状态文件路径(默认自动探测)')
     ap.add_argument('--dir', default='',
@@ -227,6 +227,16 @@ def main(argv=None):
     target_date = args.date.strip() or _today_str()
     if len(target_date) != 8 or not target_date.isdigit():
         print('[错误] --date 必须是 8 位数字 YYYYMMDD, 当前: %r' % target_date)
+        return 2
+    # P3-NB2(2026-10-29 修复)：原先 --help 承诺「填未来日期可预先封锁」，但策略侧
+    #   save_state 每次都会用当日 date 覆盖 buys 桶，未来日期的封锁会在下一次保存时
+    #   被静默擦掉 —— 用户以为封了，实际当天照样买入。这里显式拒绝非今日日期。
+    if target_date != _today_str() and args.mode != 'SHOW':
+        print('[错误] 本工具只支持操作【今天】(%s) 的封锁/计数。' % _today_str())
+        print('       原因: 策略每次保存状态都会按当日日期重建 buys 桶, 预写其它日期')
+        print('       会被下次保存静默覆盖, 形成「以为封了、实际没封」的假象。')
+        print('       如需当日禁买, 请在当天开盘前运行: --mode BLOCK')
+        print('       (仅查看历史请用 --mode SHOW --date YYYYMMDD)')
         return 2
 
     print('set_daily_buys.py %s | 母版 %s' % (VERSION, MASTER_VER))
