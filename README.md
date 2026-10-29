@@ -7,7 +7,7 @@
 
 ```
 ├── dxgp/           涨停缩量低吸策略（某券商QMT策略交易端 Python框架版）
-│   ├── zt_shrink_strategy_gbk.py   # 策略主源码 (V2.6.190)
+│   ├── zt_shrink_strategy_gbk.py   # 策略主源码 (V2.6.191)
 │   ├── download_trading_calendar.py
 │   ├── set_daily_buys.py
 │   ├── health_check_qmt.py
@@ -16,7 +16,7 @@
 │   └── V26159_变更报告.md
 │
 └── nbbank/         银行股 QMT 原生多策略
-    ├── gf_qmt_native_multi_gbk.py  # 策略主源码 (v1.2.95)
+    ├── gf_qmt_native_multi_gbk.py  # 策略主源码 (v1.2.96)
     └── backtest_optimize.py
 ```
 
@@ -43,6 +43,18 @@
 | 备份文件（`.bak*`） | 未包含 |
 | Python 解释器绝对路径 | 已替换为占位符 |
 | 编码 | GBK → UTF-8 转码 |
+
+## 🧪 测试
+
+零依赖冒烟测试（无需 QMT 环境、无需联网）：
+
+```bash
+python smoke_test.py
+```
+
+覆盖：编码完整性、语法可解析、U+FFFD、未声明 global（P1-5 类）、
+破坏性占位符（PUB-1 类）、回测白名单一致性（NA1 类）。
+CI 见 `.github/workflows/smoke-test.yml`（push/PR 自动跑）。
 
 ## 🧭 运行须知
 
@@ -83,6 +95,15 @@
 | T1 | 日历真实边界可能倒退 | 已修复 |
 | X-N1~N3 | 盘前陈旧数据/样本不足拉闸/自检失效 | 已修复 |
 | NB2~NB4 | 工具脚本日期/进程扫描/退出码 | 已修复 |
+| NI-10 | 版本号与构建日期不一致 | 已修复 |
+| D4 | 在途量随持仓记录被丢弃 | 已修复 |
+| D9 | 非首笔成交费用重复累加 | 已修复 |
+| NA2/NA3 | 回测跌幅口径、入场阈值与实盘不符 | 已对齐 |
+| NA4/NA5 | M3 未模拟、减仓只触发一次 | 已修复 |
+| NA6 | 回测亏损止损违反「绝不亏损卖出」 | 已修复 |
+| NA7 | 移动止盈峰值不更新 | 已修复 |
+| NA8/NA9 | 组合标签陈旧、冷却差一天 | 已修复 |
+| T4 | 无测试与 CI | 新增 `smoke_test.py` + GitHub Actions |
 
 ## 🛠 运行环境
 

@@ -1,0 +1,60 @@
+name: smoke-test
+
+# T4：最小 CI —— 只跑零依赖冒烟测试（不需要 QMT 环境、不需要联网）
+# 作用：任何 push / PR 都会验证
+#   ① 源文件能按声明编码解码、能被 ast 解析
+#   ② 无 U+FFFD（编码未被破坏）
+#   ③ 无未声明的 global（P1-5 类 UnboundLocalError）
+#   ④ 无 <ACCT>/<PYTHON_EXE> 等会破坏文件名的占位符（PUB-1）
+#   ⑤ 回测 COMBOS 的键都在 run_backtest 白名单内（NA1）
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run smoke test
+        run: python smoke_test.py
+
+      - name: Compile check (all .py)
+        run: |
+          python - <<'PY'
+          import pathlib, py_compile, sys
+          bad = []
+          for p in pathlib.Path('.').rglob('*.py'):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  py_compile.compile(str(p), doraise=True)
+              except Exception as e:
+                  bad.append('%s: %s' % (p, e))
+          for b in bad:
+              print('FAIL', b)
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Secret scan (账号/券商/手机号)
+        run: |
+          if grep -rnE "8973786|广发|1[3-9][0-9]{9}" --include="*.py" --include="*.md" --exclude="smoke_test.py" . ; then
+            echo "::error::发现疑似敏感信息"
+            exit 1
+          fi
+          echo "敏感信息扫描通过"

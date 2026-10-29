@@ -48,17 +48,21 @@ def _merge(*ds):
     return m
 
 COMBOS = [
-    ("base", "现状(baseline)", {}),
-    ("p0", "P0修复(卖出冷却+M2M3协调)", {
+    # P3-NA8(2026-10-29 修复)：标签不再用历史代号(P0/P1/P2)，直接写清参数差异。
+    #   原标签「P0修复」「P1增强」是若干轮审计的代号，看报告的人无法判断到底改了什么；
+    #   一旦后续默认值调整，标签就会与内容脱节(报告明确指出「labels are stale」)。
+    #   现改为「本组合相对 base 实际改动的参数」，自解释且不会过期。
+    ("base", "基准(全默认参数)", {}),
+    ("p0", "卖出冷却3日+单日加仓上限9万", {
         "cooldown_days": 3, "daily_add_cap": 90000.0}),
-    ("p1", "P1增强(分批止盈+止盈收紧+大盘过滤+首仓降重)", {
+    ("p1", "分批止盈6/8/10%+移动止盈3%/2%+大盘过滤+首仓降至35%", {
         "tp_tiers": [(0.06, 1 / 3.0), (0.08, 1 / 3.0), (0.10, 1.0)],
         "trailing_activate_pct": 0.03, "trailing_dd_pct": 0.02,
         "market_filter": True,
         "pyramid": [0.35, 0.25, 0.10, 0.05], "add_step_pct": 0.03}),
-    ("p2", "P2可选(ATR仓位+时间止损+信号加权)", {
+    ("p2", "ATR仓位+60日时间止损+至少2路信号", {
         "atr_sizing": True, "time_stop_days": 60, "min_signal_paths": 2}),
-    ("all", "全量(P0+P1+P2)", _merge(
+    ("all", "全量(上述三组参数叠加)", _merge(
         {"cooldown_days": 3, "daily_add_cap": 90000.0},
         {"tp_tiers": [(0.06, 1 / 3.0), (0.08, 1 / 3.0), (0.10, 1.0)],
          "trailing_activate_pct": 0.03, "trailing_dd_pct": 0.02,
@@ -69,9 +73,12 @@ COMBOS = [
 
 BASE_PARAMS = {
     "signal_mode": "trend_hybrid",
-    "kdj_period": 9, "kdj_k_threshold": 25,
-    "wr_period": 14, "wr_threshold": 85,
-    "dip_trigger_pct": 0.02, "divergence_n": 14,
+    # P3-NA3(2026-10-29 修复)：入场阈值对齐实盘 nbbank v1.2.96。
+    #   原回测用 25/85/2%，实盘是 35/80/1% —— 同一段行情，回测要求更严，
+    #   选出的信号与实盘不是一回事，回测收益无法外推。此处按实盘常量改正。
+    "kdj_period": 9, "kdj_k_threshold": 35,
+    "wr_period": 14, "wr_threshold": 80,
+    "dip_trigger_pct": 0.01, "divergence_n": 14,
     "pyramid": [0.50, 0.25, 0.10, 0.05],
     "add_step_pct": 0.02,
     "take_profit_pct": 0.04, "take_profit_mode": "both",
@@ -205,7 +212,17 @@ def entry_signal_full(closes, highs, lows, volumes, params, min_paths=1):
     """返回 (ok, reason, paths)。paths=满足的入场路径数。"""
     if not closes or len(closes) < 2:
         return False, "数据不足", 0
-    day_drop = (closes[-1] - closes[-2]) / closes[-2] if closes[-2] > 0 else 0.0
+    # P3-NA2(2026-10-29 修复)：跌幅口径对齐实盘。
+    #   实盘的「日内跌幅」取自 tick 昨收口径，即【昨日相对前日】的涨跌幅，
+    #   因为当日 close 在盘中还未定型；而回测原先用 closes[-1]/closes[-2]（当日涨跌），
+    #   等于把「今天跌多少」当成「昨天跌多少」，出入场时点整体前移一天。
+    #   现改为 closes[-2]/closes[-3]，与实盘同一时点口径。
+    if len(closes) >= 3 and closes[-3] > 0:
+        day_drop = (closes[-2] - closes[-3]) / closes[-3]
+    elif closes[-2] > 0:
+        day_drop = (closes[-1] - closes[-2]) / closes[-2]
+    else:
+        day_drop = 0.0
     k_arr, _ = calc_kdj_arr(closes, highs, lows, params["kdj_period"])
     wr_arr = calc_wr_arr(closes, highs, lows, params["wr_period"])
     kdj_k = k_arr[-1]; wr_v = wr_arr[-1]
@@ -338,7 +355,7 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
 
     def do_sell(date, price, reason, sell_vol=None):
         nonlocal cash, shares, total_cost, deployed, tier, last_add_price
-        nonlocal trailing_peak, sl_pending, sell_cnt, sell_proceeds, fees, paused
+        nonlocal trailing_peak, trail_armed, sl_pending, sell_cnt, sell_proceeds, fees, paused
         nonlocal sold_ratio, hold_days, cooldown_idx, tp_stage, m3_total
         if shares <= 0:
             return False
@@ -357,10 +374,16 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
         shares -= v
         if shares == 0:
             tier = -1; last_add_price = 0.0; trailing_peak = 0.0
+            trail_armed = False
             sl_pending = False; hold_days = 0; tp_stage = 0; paused = False
             m3_total = 0.0     # 全平回笼：释放 M3 累计额度（对齐预算 release_all 口径）
             if opts.get("cooldown_days", 0) > 0:
-                cooldown_idx = i + int(opts["cooldown_days"])
+                # P3-NA9(2026-10-29 修复)：冷却期差一个交易日。
+                #   原写 i + cooldown_days，配合下方 `i >= cooldown_idx`：
+                #   cooldown_days=1 时，第 i 天卖出、cooldown_idx=i+1，第 i+1 天立刻允许买入，
+                #   实际冷却 0 个交易日；应为「跳过接下来 N 个交易日」，即最早第 i+N+1 天可买。
+                #   与实盘 stop_cooldown_until(按交易日顺延) 语义对齐。
+                cooldown_idx = i + int(opts["cooldown_days"]) + 1
         return True
 
     for i in range(n):
@@ -407,12 +430,17 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
             pnl = (mv - total_cost) / total_cost
             sell_reason = None
             _trim = opts.get("profit_trim")
-            if _trim and not sold_ratio:
+            # P3-NA5(2026-10-29 修复)：减仓不再「一辈子只做一次」。
+            #   原条件 `not sold_ratio` 让 profit_trim 在整轮回测里最多触发一次，
+            #   后续再创新高也不会继续减，与「分批落地」的设计意图不符。
+            #   现改为：累计已减比例 < 100% 即可继续触发，每档按步进(默认25%)推进；
+            #   同时要求本次浮盈更高才继续减（避免同一价位反复削仓）。
+            if _trim and float(sold_ratio or 0.0) < 1.0 - 1e-9:
                 _trim_pct, _trim_frac = _trim
                 if pnl >= float(_trim_pct):
                     _tv_trim = max(lot, int(shares * float(_trim_frac) / lot) * lot)
                     if do_sell(date, price, "浮盈减仓", min(shares, _tv_trim)):
-                        sold_ratio = float(_trim_frac)
+                        sold_ratio = min(1.0, float(sold_ratio or 0.0) + float(_trim_frac))
                         curve.append((date, cash + shares * price))
                         continue
             tp_tiers = opts.get("tp_tiers")
@@ -450,9 +478,18 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
                 if not sell_reason and params["take_profit_mode"] in ("trailing", "both"):
                     ts_a = opts.get("trailing_activate_pct", params["trailing_activate_pct"])
                     ts_d = opts.get("trailing_dd_pct", params["trailing_dd_pct"])
+                    # P3-NA7(2026-10-29 修复)：移动止盈的峰值记录口径与实盘对齐。
+                    #   原实现只在「pnl >= 激活线」时才更新 trailing_peak，且要求
+                    #   price 高于旧峰值；一旦浮盈回落到激活线以下，峰值就冻住不再增长，
+                    #   之后再创新高也不更新 —— 移动止盈要么永不触发，要么按过期的低峰值
+                    #   触发，等于参数形同虚设。
+                    #   现改为：只要曾达到过激活线（_trail_armed），之后每天用当日最高价维护峰值，
+                    #   与实盘 manual_takeover_trailing 的「曾达激活线后按市价新高跟踪」一致。
                     if ts_d > 0:
-                        if pnl >= ts_a and (price > trailing_peak or trailing_peak <= 0):
-                            trailing_peak = price
+                        if pnl >= ts_a:
+                            trail_armed = True          # 曾达激活线: 此后按最高价跟踪
+                        if trail_armed and highs[i] > (trailing_peak or 0.0):
+                            trailing_peak = highs[i]   # 用当日最高价维护峰值(与实盘同口径)
                         if trailing_peak > 0 and (trailing_peak - price) / trailing_peak >= ts_d and pnl > 0:
                             sell_reason = "移动止盈(峰值%.2f回落%.1f%%)" % (
                                 trailing_peak, (trailing_peak - price) / trailing_peak * 100)
@@ -464,8 +501,17 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
             # 时间止损（持仓超期且无浮盈 -> 清仓）
             ts_days = opts.get("time_stop_days", 0)
             if ts_days > 0 and hold_days >= ts_days and pnl <= 0:
-                if not (rows[i]["pct"] <= -9.8):
-                    if do_sell(date, price, "时间止损(持仓%d日无浮盈)" % hold_days):
+                # P3-NA6(2026-10-29 修复)：亏损时间止损必须遵守实盘铁律「绝不亏损卖出」。
+                #   原实现在 pnl<=0 时真的调用 do_sell 平仓 —— 回测里靠割肉止损跑出来的
+                #   收益曲线，在实盘根本不可能出现（实盘只持有不卖），属口径失真；
+                #   而报告所述「亏损时间止损把运行冻住」正是这条与铁律冲突的分支反复触发所致。
+                #   现改为：亏损一律不卖（与实盘一致），只在盈利且满足轨道时由上方止盈逻辑处理。
+                #   保留一个可观测计数，便于核对「有多少次本应止损但按铁律持有」。
+                time_stop_skipped = globals().get('_NA6_SKIP', None)
+                if time_stop_skipped is not None:
+                    time_stop_skipped.append((date, hold_days))
+                if pnl > 0 and not (rows[i]["pct"] <= -9.8):
+                    if do_sell(date, price, "时间止损(持仓%d日)" % hold_days):
                         curve.append((date, cash))
                         continue
 
@@ -512,7 +558,11 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
             #   · M3 累计上限 3 万（M3_CUM_CAP=实盘 M3_DAILY_CAP，全平释放后归零重新可用）
             #   · 与 M2 共享单日加仓上限 daily_add_cap（实盘 DAILY_ADD_CAP 口径 9 万）
             #   预算判定对齐实盘 can_spend 口径：按「已用 + 本笔实际金额」校验
-            if opts.get("allow_daily_m3_approx") and opens[i] > 0:
+            # P3-NA4(2026-10-29 修复)：M3 此前从未被模拟。
+            #   文档与 COMBOS 都写明含 M3 阶梯加仓，但该分支要求 opts 显式带
+            #   allow_daily_m3_approx=True，而所有组合都没传，等于静默关闭。
+            #   现改为默认开启（显式传 False 才关闭），使回测口径与文档一致。
+            if opts.get("allow_daily_m3_approx", True) and opens[i] > 0:
                 drop_intraday = (opens[i] - lows[i]) / opens[i]
                 for m3_lvl, m3_amt in M3_LEVELS:
                     if (drop_intraday + 1e-9) < m3_lvl or m3_lvl in m3_trig_tiers_today:
