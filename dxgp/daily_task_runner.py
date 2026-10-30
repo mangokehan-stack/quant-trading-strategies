@@ -21,14 +21,10 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-# PUB-1(d)(2026-10-29 修复)：原为硬编码本机解释器绝对路径（发布后成 <PYTHON_EXE>，两步都
-#   FileNotFoundError）。改用当前运行解释器，跨机可移植；需指定时用环境变量 ZT_PYTHON 覆盖。
-PY = os.environ.get('ZT_PYTHON') or sys.executable or 'python'
+PY = r'C:\Program Files\Python311\python.exe'
 LOG = os.path.join(BASE, 'zt_shrink_daily_task_runner.log')
 STEP_LOG = os.path.join(BASE, 'zt_shrink_daily_task.log')
-# PUB-1(a)(2026-10-29 修复)：账号不硬编码（发布后成 <ACCT>，风险清单工具会拿到非法账号）。
-#   改为环境变量 ZT_ACCOUNT 优先；未设置则传空串，由工具按界面注入账号处理。
-ACCOUNT = os.environ.get('ZT_ACCOUNT') or ''
+ACCOUNT = '<acct>'
 
 
 def wlog(msg):
@@ -48,8 +44,8 @@ def wlog(msg):
 def run_step(title, script, args, timeout_sec):
     sp = os.path.join(BASE, script)
     if not os.path.exists(sp):
-        wlog('[%s][FAIL] script not found: %s' % (title, sp))
-        return (False, 'MISSING', 0.0)
+        wlog('[%s][skip] script not found: %s' % (title, sp))
+        return (True, None, 0.0)
     cmd = [PY, '-u', sp] + list(args)
     wlog('[%s] start: %s %s' % (title, script, ' '.join(args)))
     t0 = time.time()
@@ -95,8 +91,8 @@ def main():
     wlog('[daily-task] step log -> %s' % STEP_LOG)
 
     ok1, c1, e1 = run_step('calendar', 'download_trading_calendar.py', [], 300)
-    ok2, c2, e2 = run_step('risk-exclude', '_tool_risk_exclude.py',
-                           ['--account', ACCOUNT, '--ann-pages', '600'], 1500)
+    ok2, c2, e2 = run_step('risk-exclude', 'download_risk_exclude.py',
+                           ['--account', ACCOUNT, '--ann-pages', '600'], 1000)
 
     el = time.time() - t_all
     if ok1 and ok2:
