@@ -1667,8 +1667,15 @@ def startup_selftest():
             if _sf2 and os.path.exists(_sf2):
                 with open(_sf2, 'rb') as _fh2:
                     _raw2 = _fh2.read()
+                # P3-3(2026-10-30 评审修复)：解码顺序由 gbk 优先改为 utf-8 优先。
+                #   原因：本文件是 GBK 真身；但「被误存成 UTF-8 且已出 U+FFFD」的损坏文件，
+                #   按 gbk 先解会把 UTF-8 的替换字符字节当 GBK 疑似合法字解出来(锟斤拷)，
+                #   中文计数照常达标、U+FFFD=0，体检绿灯通过 —— 恰好放过最需要报警的场景。
+                #   utf-8 解码更严格(连 U+FFFD 都是一个合法码位、被破坏时多半直接抛错)，
+                #   先试 utf-8：失败则必然是 GBK(正常路径)，成功则说明文件已成 UTF-8，
+                #   下方 U+FFFD 统计在 utf-8 视角下才是真值。
                 _src2 = None
-                for _enc2 in ('gbk', 'utf-8'):
+                for _enc2 in ('utf-8', 'gbk'):
                     try:
                         _src2 = _raw2.decode(_enc2)
                         break

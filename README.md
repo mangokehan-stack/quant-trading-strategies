@@ -7,7 +7,7 @@
 
 ```
 ├── dxgp/           涨停缩量低吸策略（某券商QMT策略交易端 Python框架版）
-│   ├── zt_shrink_strategy_gbk.py   # 策略主源码 (V2.6.191)
+│   ├── zt_shrink_strategy_gbk.py   # 策略主源码 (V2.6.196)
 │   ├── download_trading_calendar.py
 │   ├── set_daily_buys.py
 │   ├── health_check_qmt.py
@@ -16,7 +16,7 @@
 │   └── V26159_变更报告.md
 │
 └── nbbank/         银行股 QMT 原生多策略
-    ├── gf_qmt_native_multi_gbk.py  # 策略主源码 (v1.2.96)
+    ├── gf_qmt_native_multi_gbk.py  # 策略主源码 (v1.2.100)
     └── backtest_optimize.py
 ```
 

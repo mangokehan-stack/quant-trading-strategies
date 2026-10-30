@@ -735,7 +735,7 @@ var DATES=__DATES__, CURVES=__CURVES__, STATS=__STATS__, TRADES=__TRADES__;
 var PERIODS=Object.keys(DATES), COMBOS=Object.keys(CURVES[PERIODS[0]]);
 var NAMES=CURVES[PERIODS[0]], COLORS={};
 Object.keys(NAMES).forEach(function(c){COLORS[c]=NAMES[c].color;});
-document.getElementById('sub').textContent='三区间(2024/2025/2026H1) × 五组合(baseline/P0/P1/P2/全量) | 初始资金 330,000 | 腾讯前复权日线 | 信号用昨日及以前120根K';
+document.getElementById('sub').textContent='三区间(2024/2025/2026H1) × 五组合(baseline/P0/P1/P2/全量) | 初始资金 200,000 | 腾讯前复权日线 | 信号用昨日及以前120根K';
 
 var st=document.getElementById('sumtab');
 st.innerHTML='<tr><th>区间</th>'+COMBOS.map(function(c){return '<th>'+NAMES[c].name+'</th>';}).join('')+'</tr>';
