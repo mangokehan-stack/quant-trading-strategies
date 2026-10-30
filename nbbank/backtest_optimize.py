@@ -315,6 +315,11 @@ def run_backtest(rows, idx_closes, params, opts, start, end=None):
     cash = params["init_capital"]
     shares = 0; total_cost = 0.0; deployed = 0.0
     tier = -1; last_add_price = 0.0; trailing_peak = 0.0
+    # P1-4(2026-10-30 评审修复)：trail_armed 此前只在 do_sell 里以 nonlocal 声明、
+    #   在「曾达激活线」和「清仓」两处赋值，却从未初始化 —— 首次买入后第一根 bar
+    #   若 pnl < ts_a 就跳过赋值，执行到 `if trail_armed:` 直接抛
+    #   UnboundLocalError: cannot access local variable 'trail_armed'，整份回测跑不起来。
+    trail_armed = False
     peak_equity = 0.0; paused = False; sl_pending = False
     sold_ratio = 0.0; hold_days = 0; cooldown_idx = -1
     tp_stage = 0                 # 分批止盈已执行到的档位（每档只触发一次，全平归零）

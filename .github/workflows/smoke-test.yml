@@ -53,8 +53,61 @@ jobs:
 
       - name: Secret scan (账号/券商/手机号)
         run: |
-          if grep -rnE "<acct>|广[发]|1[3-9][0-9]{9}" --include="*.py" --include="*.md" --exclude="smoke_test.py" . ; then
-            echo "::error::发现疑似敏感信息"
-            exit 1
-          fi
-          echo "敏感信息扫描通过"
+          # P1-6(2026-10-30 评审修复)：原规则用 grep 直接对二进制字节做匹配，有两个问题：
+          #   ① 把 "<acct>" 当敏感词 —— 而 <acct> 正是本仓库自己的脱敏占位符，
+          #      daily_task_runner.py / set_daily_buys.py 都在用 -> 每次运行必然命中，CI 每次必败；
+          #   ② 仓库内 GBK 与 UTF-8 文件混存，grep 对 GBK 文件按字节匹配中文会字错位，
+          #      产生"广发"之类的假阳性。
+          #   现改用 Python 按各文件真实编码解码后再判，占位符白名单放行。
+          python - <<'PY'
+          import os, re, sys
+
+          ROOT = "."
+          SKIP_FILES = {"smoke_test.py", "smoke-test.yml"}
+          SKIP_DIRS = {".git", "__pycache__", ".github"}
+
+          # 真实敏感形态（不含占位符）
+          PAT_GUANG = re.compile("广[\u53d1]")            # 券商名称
+          PAT_PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+          # 账号类变量被赋真实数字字面量（排除 ""、<acct>、占位符）
+          PAT_ACCT = re.compile(
+              r"(?:ACCOUNT|DEFAULT_ACCT|acct|account)\s*=\s*[\"'\\]?(\d{6,12})[\"'\\]?"
+          )
+          # 允许的占位符形态
+          PLACEHOLDERS = {"<acct>", "<ACCOUNT>", "<PYTHON_EXE>", "", "None"}
+
+          def decode(raw):
+              for enc in ("utf-8", "gbk"):
+                  try:
+                      return raw.decode(enc), enc
+                  except Exception:
+                      continue
+              return raw.decode("utf-8", errors="replace"), "replace"
+
+          bad = []
+          for dirpath, dirnames, filenames in os.walk(ROOT):
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for fn in filenames:
+                  if fn in SKIP_FILES or not fn.endswith((".py", ".md")):
+                      continue
+                  path = os.path.join(dirpath, fn)
+                  try:
+                      raw = open(path, "rb").read()
+                  except Exception:
+                      continue
+                  text, _enc = decode(raw)
+                  rel = os.path.relpath(path, ROOT)
+                  for m in PAT_GUANG.finditer(text):
+                      bad.append((rel, "券商字样", m.group(0)))
+                  for m in PAT_PHONE.finditer(text):
+                      bad.append((rel, "手机号", m.group(0)))
+                  for m in PAT_ACCT.finditer(text):
+                      if m.group(1) not in PLACEHOLDERS:
+                          bad.append((rel, "账号数字", m.group(1)))
+
+          if bad:
+              for rel, kind, val in bad[:30]:
+                  print("::error::%s: %s (%s)" % (rel, kind, val))
+              sys.exit(1)
+          print("敏感信息扫描通过（占位符已白名单放行）")
+          PY

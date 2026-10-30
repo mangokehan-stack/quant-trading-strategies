@@ -9,7 +9,40 @@
 #   统一收口为「F2大盘过滤(大盘整体弱就不开新仓)」(只括注一次，风格一致，便于阅读与机器解析)；
 #   L8089/L8890/L8894 为打印到日志的执行行，L3380 顺带统一；纯日志修缮，不改变任何交易判断
 #   与参数(PARAMS 指纹不变)，铁律零变更。
-#  ★ GBK 代码文件已更新至最新版本 (v1.2.98, 2026-10-29)。
+#  ★ GBK 代码文件已更新至最新版本 (v1.2.100, 2026-10-30)。
+# [v1.2.100 修改时间 2026-10-30] 按第三方代码评审报告修复 P1/P2/P3 共 9 项(GBK 直改, 编码不变):
+#   P1-1 【严重】bar顶部 _pending_clear 前置条件写反(_PENDING_BUYS==0 才清)形成死锁悖论——
+#        _pending_clear 本就是唯一清空 _PENDING_BUYS 的函数, 买单正常成交后永远清不掉,
+#        180秒后 settle_pending_timeout 把 state 整体回滚到下单前快照, tier/first_batch_n/
+#        firstpos_date 全丢 -> 第2/3批与M2加仓永久失效、同价位重复买入。改为正向条件:
+#        有在途 + 券商策略股数已达账本股数 才清。
+#   P1-2 【严重】_in_flight 判据只在'一股未成交'时成立, 部分成交(1600中成交600)被当成
+#        已落账 -> position_shares 被覆写成600而 total_cost 仍为全额, 均价虚高到66.86元
+#        (真实25.00) -> 止盈永不触发, 尾单到账又被误记成手工仓。改为'在途且券商股数未达账本'。
+#   P1-3 【严重】多根bar分笔卖出时用'初始快照-当根增量'而非'初始快照-累计已卖', 前几根bar
+#        扣掉的股数被丢弃: 4000股分1000+1500两笔, 第3根bar算出2500(应1500), 成本62505(应37503),
+#        均价虚高66.7%; 同时持手工仓时解冻还会把用户手工仓清零吞入策略仓。改用 _sold_raw。
+#   P2-5 交易日未知时由 (True,'weekday_fallback') 改回 (False,'unknown'), 让 sell_only
+#        (只卖不买)降级模式复活——原写法使该模式与 _mode_pending_recheck 全变死代码,
+#        且未缓存的工作日法定假日会照常发实盘买单。
+#   P2-6 N13降级止盈: 移除错加的 in_cooldown(买入冷却)闸门(T+1次日仍在冷却期内会堵死止盈),
+#        补 sell_pending_until 在途防重(原每根bar重复发卖单), 并补齐卖出后 stop_cooldown_until/
+#        firstpos_date/sell_pending_until 三个状态, 与主止盈路径对齐。
+#   P2-7 单实例锁: 锁文件属本实例(token一致)时立即重获, 修掉瞬时读盘失败后自我锁死约540秒。
+#   P2-8 M3台账 JSON 损坏时不再静默当空台账(会丢持仓记录且无告警), 改为备份 .corrupt + 告警。
+#   P3-1 在途卖单短路闸门由止盈段前移到涨停卖出之前, 防涨停卖单跨bar未成交时重复发单。
+#   P3-2 _LOG_KEY_ALWAYS 去掉 '【止盈平仓】'/'【涨停卖出】' 末尾右括号(实际文案带参数,
+#        带括号永远匹配不上, 关键成交证据链仍会被300秒去重吞掉)。
+#   铁律零触碰: 绝不止损/扣费后赚钱才卖/移交释放双额度 全部原样; 无新增模块级大写常量。
+# [v1.2.99 修改时间 2026-10-30] 双实例锁同进程自撞误报修复(GBK 直改, 编码不变):
+#   1) 根因：_instance_lock_acquire 判定活跃锁时只查心跳新鲜度(_now-_ts < 600s)，未比对锁文件
+#      记录的 pid；而锁文件本就写了 pid(=os.getpid())。QMT 客户端启动时会自动跑一次策略写锁，
+#      用户再手动点「运行」会触发第二次——二者同属一个 XtItClient 进程，pid 完全相同、心跳也新鲜，
+#      于是被误判成「另一个实例在跑」而降级成只观察，反复打印【双实例拦截】告警。这是同进程自撞，并非真多开。
+#   2) 修复：读锁文件后若记录 pid == 本进程 pid，直接续命本进程的锁(重写 hb=now、置 _INSTANCE_LOCK_ACQUIRED=True)
+#      并 return True，不再误判降级。真正的跨进程多开(不同 pid)仍按原逻辑拦截，防护不削弱。
+#   3) 仅改单实例锁判定一处，交易判据/阈值/仓位/卖出逻辑/参数(PARAMS 指纹)/铁律零变更：
+#      坚决不止损、扣全费真赚才卖、人工接管释放额度原样保留。
 # [v1.2.98 修改时间 2026-10-29] 头部历史声明去歧义(GBK 直改, 编码不变):
 #   1) 把 v1.2.92 时代的旧"已更新至最新版本"声明改写为"（历史记录）"样式, 去掉"最新"二字——
 #      原先头部出现两条"已更新至最新版本"(L12=v1.2.97/L26=v1.2.92), 从后往前翻会误以为重复或过时;
@@ -1746,7 +1779,13 @@ def is_trade_day(today=None):
     #     · 周一至周五 -> 视为交易日放行，safe：passorder 若逢真假日会被券商拒单，
     #       策略侧有拒单退避与冷却，不会造成实际损失；而漏掉止盈的代价更高。
     #   init 阶段仍会通过 source='weekday_fallback' 打出「节假日表缺失请补表」告警。
-    return (True, "weekday_fallback")
+    # P2-5(2026-10-30 评审修复)：改回 (False, "unknown")。
+    #   N6 曾改成 (True,"weekday_fallback") 想"工作日放行"，但 _determine_trade_mode
+    #   只有在 ok is False and src == "unknown" 时才进 "sell_only" 只卖不买模式 ——
+    #   返回 True 后 L2578 直接走 "normal"，整个 sell_only 降级与 _mode_pending_recheck
+    #   都变成死代码；在未缓存的工作日法定假日（如日历只到 2026-12-31 时的 2027-01-01）
+    #   策略会照常发实盘买单。宁可错过不可错买，恢复保守语义。
+    return (False, "unknown")
 
 
 def previous_trading_day(day_str, max_back=15):
@@ -1780,7 +1819,7 @@ def previous_trading_day(day_str, max_back=15):
 # ---------------------------------------------------------------------------
 # 1.6 策略版本（全平台统一版本号：母版/生成器/QMT交付件/聚宽版 对齐，init 打印版本自检）
 # ---------------------------------------------------------------------------
-STRATEGY_VERSION = "v1.2.98"   # 2026-10-29 P1/P2/P3 全量修复轮: 在途结算幂等(P1-1)、卖出扣账本(P1-2)、
+STRATEGY_VERSION = "v1.2.100"   # 2026-10-30 双实例锁同进程自撞误报修复(v1.2.99): 锁判定增加 pid 自比，同进程自撞直接续命不再误判降级；
                                #   在途口径统一(P1-3/P1-4)、运行模式补测 global(P1-5)；
                                #   锁读取分级(NI-2)、日志句柄(NI-3)、状态写 .prev 回退(NI-4)、
                                #   T+1 手工仓钳制(NEW-E)、跨年交易日兜底(N6)、盈亏去重(PNL)、
@@ -1797,7 +1836,7 @@ STRATEGY_VERSION = "v1.2.98"   # 2026-10-29 P1/P2/P3 全量修复轮: 在途结算幂等(P1
 # P3-NI-10(2026-10-29 修复)：构建日期与版本号必须同步——原为 2026-10-27，
 #   而 STRATEGY_VERSION 是 v1.2.95(2026-10-25)，两者对不上，排查时无法由构建串
 #   反查到底是哪一版。今后改版本号务必同时改这一行。
-STRATEGY_BUILD = "2026-10-29"   # 构建日期；v1.2.92 为日志末尾追加 3 个空格(仅显示格式, 零逻辑变更)；v1.2.91 为过户费注释残留同步(纯注释, 数值零变更)；v1.2.65 为次日增量（AUD27 手工仓分离）；v1.2.86 为 N-2 零预设独立审计修复；v1.2.87 为探测明细降噪；v1.2.88 为运行模式显示强化；v1.2.90 为打包日期更正(此前误记2026-10-26)
+STRATEGY_BUILD = "2026-10-30"   # 构建日期；v1.2.92 为日志末尾追加 3 个空格(仅显示格式, 零逻辑变更)；v1.2.91 为过户费注释残留同步(纯注释, 数值零变更)；v1.2.65 为次日增量（AUD27 手工仓分离）；v1.2.86 为 N-2 零预设独立审计修复；v1.2.87 为探测明细降噪；v1.2.88 为运行模式显示强化；v1.2.90 为打包日期更正(此前误记2026-10-26)
 
 # ---- 数据就绪拦截闸门（2026-09-28）：所需数据未就绪 -> 拦截交易 + 列清单 ----
 # P1-5 修复(2026-10-01)：移除模态弹窗（无超时 MessageBoxW 阻塞内置 Python 单线程，
@@ -2681,6 +2720,7 @@ def _instance_lock_acquire():
         return True
     for _try34 in range(3):
         _now = time.time()
+        _owner_self = False
         if os.path.exists(_INSTANCE_LOCK_FILE):
             _ts = 0.0
             _lock_read_ok = False
@@ -2688,6 +2728,8 @@ def _instance_lock_acquire():
                 with open(_INSTANCE_LOCK_FILE, "r", encoding="utf-8") as _f:
                     _lock_data = json.loads(_f.read() or "{}") or {}
                 _ts = float(_lock_data.get("hb", 0.0) or 0.0)
+                # P2-7：记下锁持有者 token，供"自己锁自己"时立即重获
+                _owner_self = (str(_lock_data.get("token", "") or "") == _INSTANCE_LOCK_TOKEN)
                 _lock_read_ok = True
                 globals()['_INSTANCE_LOCK_READ_FAILS'] = 0   # NI-2：读成功即清零失败计数
             except Exception:
@@ -2718,7 +2760,32 @@ def _instance_lock_acquire():
                 log("【单实例锁】锁文件连续%d次读取失败，本轮按他人持锁处理(只观察)"
                     % _lock_fail_n)
                 return False
+            # === 双实例自撞修复(v1.2.99) ===
+            # 锁文件记录的 pid 若等于本进程 pid，说明是「同一进程内策略被启动两次」：
+            # QMT 客户端启动时会自动跑一次策略写锁(pid=本进程)，用户再手动点「运行」会触发
+            # 第二次；二者同属一个 XtItClient 进程，pid 相同。这不是真多开，应直接续命本进程的
+            # 锁，不要再 return False 把本实例降级成只观察(否则大盘翻多时会踏空)。
+            _lock_pid = int(_lock_data.get("pid", 0) or 0)
+            if _lock_pid and _lock_pid == os.getpid():
+                try:
+                    with open(_INSTANCE_LOCK_FILE, "w", encoding="utf-8") as _fp:
+                        _fp.write(json.dumps({"pid": os.getpid(), "token": _INSTANCE_LOCK_TOKEN, "hb": _now}))
+                except Exception:
+                    pass
+                _INSTANCE_LOCK_ACQUIRED = True
+                _INSTANCE_LOCK_LAST_TOUCH = _now
+                return True
             if _ts > 0 and (_now - _ts) < _INSTANCE_LOCK_STALE_SEC:
+                # P2-7(2026-10-30 评审修复)：锁文件里是自己的 token 时直接重获。
+                #   病因：_instance_lock_touch() 遇到一次瞬时读盘失败会把
+                #   _INSTANCE_LOCK_ACQUIRED 置 False；下一根 bar 再 acquire 时读到
+                #   自己写的锁（心跳还很新），旧实现不区分 owner 一律 return False，
+                #   于是本实例被自己锁在门外约 540 秒（连止盈都停）。
+                if _owner_self:
+                    _INSTANCE_LOCK_ACQUIRED = True
+                    _INSTANCE_LOCK_LAST_TOUCH = _now
+                    log('【单实例锁】锁文件属本实例(token 一致)，重新持锁恢复下单')
+                    return True
                 return False          # 活跃锁：另一实例正在运行，本实例只观察
             try:
                 os.remove(_INSTANCE_LOCK_FILE)   # 陈旧残留：抢占
@@ -5251,7 +5318,27 @@ def load_m3(code):
         return {"date": "", "triggered": [], "used": 0.0, "m2_used": 0.0}
     try:
         all_m = json.loads(_blob.decode("utf-8"))
-    except Exception:
+    except Exception as _jm_err:
+        # P2-8(2026-10-30 评审修复)：损坏的 M3 台账不再静默清零。
+        #   旧实现 except 后直接 all_m = {}，函数返回 0 股 0 额度的默认值，
+        #   已有的 M3 持仓记录被无声丢弃 —— 当日加仓额度被重置(可能超额加仓)，
+        #   且日志里看不出任何异常。现与 load_state 同口径：置坏档标记 + 备份 .corrupt + 告警。
+        _LS_STATUS["m3"] = "corrupt"
+        try:
+            _bk = M3_STATE_FILE + ".corrupt"
+            with open(_bk, "wb") as _bf:
+                _bf.write(_blob)
+            log("【M3台账损坏】已备份为 %s，本次按空台账继续(请人工核对M3持仓)"
+                % os.path.basename(_bk))
+        except Exception:
+            log("【M3台账损坏】%s 解析失败(%s)，且备份失败，本次按空台账继续"
+                % (os.path.basename(M3_STATE_FILE), repr(_jm_err)[:80]))
+        try:
+            _notify_risk("m3_corrupt",
+                         "M3 台账 JSON 损坏(%s): 当日 M3 加仓额度已重置，请人工核对持仓"
+                         % repr(_jm_err)[:80])
+        except Exception:
+            pass
         all_m = {}
     d = all_m.get(code) if isinstance(all_m, dict) else None
     if isinstance(d, dict):
@@ -6988,9 +7075,15 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
             #   现按「实际卖出量」等比扣减策略账本；手工仓部分单独在上面扣，互不串账。
             _ps_before_p12 = int(_ss.get("position_shares", 0) or 0)
             _m_before_p12 = int(_ss.get("manual_shares", 0) or 0)
-            # 手工仓先吸收本次卖出(allow_manual 时)，余量才算策略自己的卖出
-            _sold_manual_p12 = min(_sold, _m_before_p12) if _ss.get("allow_manual") else 0
-            _sold_strat_p12 = max(0, min(_sold - _sold_manual_p12, _ps_before_p12))
+            # P1-3(2026-10-30 评审修复)：扣减必须用【累计已卖 _sold_raw】，不是当根增量 _sold。
+            #   _ss 是卖出下单时的静态初始快照(position_shares/total_cost 不随 bar 变化)，
+            #   旧实现用「初始快照 - 当根增量」，第 2 根及之后的成交 bar 会把前几根 bar 已扣的
+            #   股数全部丢弃：4000 股分 1000+1500 两笔卖出，第 3 根 bar 算出 4000-1500=2500(应 1500)，
+            #   成本 62505.88(应 37503.53)，均价虚高 66.7% -> 止盈永不触发；
+            #   若同时持有手工仓，解冻后还会把用户手工仓吞进策略仓。
+            #   注：_pnl_record_close 仍用 _sold(当根增量)保证不重复记账，两者口径不同、各司其职。
+            _sold_manual_p12 = min(_sold_raw, _m_before_p12) if _ss.get("allow_manual") else 0
+            _sold_strat_p12 = max(0, min(_sold_raw - _sold_manual_p12, _ps_before_p12))
             if _sold_strat_p12 > 0 and _ps_before_p12 > 0:
                 _cost_before_p12 = float(_ss.get("total_cost", 0.0) or 0.0)
                 # 按股数比例折算被卖出的成本(与 _pnl_record_close 口径一致)
@@ -7014,7 +7107,9 @@ def _sync_state_to_actual(C, acct, code, state, actual_vol, broker_avg, price):
                        float(state.get("deployed", 0.0) or 0.0)))
             if _ss.get("allow_manual"):
                 _m_before = int(_ss.get("manual_shares", 0) or 0)
-                _m_sold = min(_sold, _m_before)
+                # P1-3(2026-10-30 评审修复)：手工仓扣减同样必须用累计 _sold_raw，
+                #   否则多根 bar 分笔卖出时会少扣、并在窗口解冻时把用户手工仓清零吞入策略仓。
+                _m_sold = min(_sold_raw, _m_before)
                 _m_cost = float(_ss.get("manual_cost", 0.0) or 0.0) * (_m_sold / float(_m_before)) if _m_before else 0.0
                 _px = float(_ss.get("price", price) or price)
                 _mv = _px * _m_sold
@@ -8546,7 +8641,7 @@ def _hdiag_log(C, code, params, state):
         in_win = _in_entry_window(_hms)
 
         # ---- 组装 ----
-        _day_txt = "平" if abs(dd) < 1e-9 else ("涨%.2f%%" % (dd * 100.0) if dd > 0 else "跌%.2f%%" % (dd * 100.0))
+        _day_txt = "平" if abs(dd) < 1e-9 else ("涨%.2f%%" % (dd * 100.0) if dd > 0 else "跌%.2f%%" % (abs(dd) * 100.0))
         _open_gap = ((open_px - _lc) / _lc * 100.0) if (_lc > 0 and open_px > 0) else 0.0
         _parts = ["现价%.2f 昨收%.2f 开%.2f(%s%.2f%%) 日内%s(相对昨收)" % (
             price, _lc, open_px, ("高开" if _open_gap >= 0 else "低开"), abs(_open_gap), _day_txt)]
@@ -8834,14 +8929,29 @@ def _handlebar_impl(C, code, cfg, params, state):
         #   ① 卖出冷却期内不再卖（与主路径 in_cooldown 同口径）；
         #   ② 当日已因涨停卖出过则跳过（与主路径 limit_sell_date 同口径）。
         _today13 = datetime.now().strftime("%Y-%m-%d")
-        if in_cooldown(state):
-            _note_entry_block(code, "N13历史缺失止盈-卖出冷却期内")
+        # P2-6(2026-10-30 评审修复)：两处缺陷。
+        #  ① in_cooldown 是【买入冷却】(止损/移动止盈后设 24 小时)，而 A 股 T+1 下当日
+        #    新加的仓要次日才能卖，次日 in_cooldown 往往仍为 True —— 于是行情异常
+        #    (hist4 is None)时，T+1 剩余持仓被禁止止盈卖出，等于堵死退出通道。
+        #    主止盈路径从不检查 in_cooldown，此处属错加的闸门，予以移除。
+        #  ② 缺 sell_pending_until 防重：sell_all 发出后若下一根 bar 仍未成交且
+        #    hist4 依旧 None，会每根 bar 重复发卖单。补上与主路径(L9288)同口径的检查。
+        #  ③ 卖出成功后补齐状态更新(stop_cooldown_until / firstpos_date / sell_pending_until)，
+        #    与主路径 L9305-9312 对齐，避免成交后同一根 bar 立刻重新开首仓。
+        _spu13 = float(state.get("sell_pending_until", 0.0) or 0.0)
+        if _spu13 > time.time():
+            _note_entry_block(code, "N13历史缺失止盈-卖出在途(防重复发单)")
             return
         if state.get("limit_sell_date", "") == _today13:
             _note_entry_block(code, "N13历史缺失止盈-当日涨停卖出过")
             return
         _tp13, _why13 = should_take_profit(state, price, params)
         if _tp13 and sell_all(C, code, acct, price, _why13, state):
+            state["stop_cooldown_until"] = cooldown_deadline()
+            state["firstpos_date"] = _today13
+            state["sell_pending_until"] = time.time() + _SELL_PENDING_TTL
+            log("[%s] 【N13降级止盈】历史指标缺失，按状态+现价止盈 %s | 卖出冷却至 %s"
+                % (_cn(code), _why13, state["stop_cooldown_until"]))
             save_state(code, state)
         return
     # AUD17(2026-10-04)：fetch_hist_fields 返回五元组，末位为「末根是否当日bar」口径标志；
@@ -8984,8 +9094,14 @@ def _handlebar_impl(C, code, cfg, params, state):
     #   现统一折算到策略口径 (负值钳 0)；手工仓为 0 时与旧行为完全一致。
     _ms_inf = int(state.get("manual_shares", 0) or 0)
     _actual_strat_inf = max(0, int(actual_vol) - _ms_inf)
-    _in_flight = (_pend > 0 and _actual_strat_inf != state["position_shares"]
-                  and _actual_strat_inf == state["position_shares"] - _pend)
+    # P1-2(2026-10-30 评审修复)：_in_flight 判据错误导致部分成交被误同步。
+    #   旧条件 = (_pend>0) and (券商策略股数 != position_shares) and (券商 == position_shares - _pend)
+    #   —— 只在「一股都没成交」时成立。券商先成交一部分(如 1600 股中成交 600)时，
+    #   _actual_strat_inf=600 落在 (0, 1600) 中间，两个等式都不满足 -> _in_flight=False
+    #   -> 走外部同步分支把 position_shares 覆写成 600，而 total_cost 保持全额 40115.65
+    #   -> 均价暴涨到 66.86 元(真实 25.00) -> 止盈永不触发；尾单到账后又被判成手工仓。
+    #   现改为「只要在途且券商股数尚未达到账本股数，就一直算在途」，部分成交不再提前收敛。
+    _in_flight = (_pend > 0 and _actual_strat_inf < int(state.get("position_shares", 0) or 0))
     if _in_flight:
         _log_dup_guard(code, "在途买单%d股尚未落账(内部记录%d股/券商%d股)，保持状态等待成交回报"
                        % (_pend, state["position_shares"], actual_vol))
@@ -9027,9 +9143,16 @@ def _handlebar_impl(C, code, cfg, params, state):
         #   并且 _ps34 恰好等于 expected 时，pending 被清 -> 剩余在途量失去闸门保护，
         #   下一根 bar 把未成交部分误记成手工仓，策略成本虚高、止盈永不触发。
         #   现要求 pending 已归零(即 _pending_ledger_settle 已在终态结算点收敛完毕)才清。
-        if (_ps34 == state.get("expected_shares", _ps34)
-                and _ps34 > 0
-                and _PENDING_BUYS.get(code, 0) == 0):
+        # P1-1(2026-10-30 评审修复)：原条件要求 _PENDING_BUYS==0 才调用 _pending_clear，
+        #   而 _pending_clear 正是全代码中唯一把 _PENDING_BUYS 清零的函数 —— 死锁悖论：
+        #   只要买单正常成交，_PENDING_BUYS>0 恒成立，_pending_clear 永不触发，
+        #   180 秒后 settle_pending_timeout 把 state 整体回滚到下单前快照(before)，
+        #   tier/first_batch_n/firstpos_date 全丢 -> 第 2/3 批与 M2 加仓永久失效，
+        #   M2 还会在同一价位重复买入。
+        #   现改为正向条件：有在途买单 + 券商策略股数已达账本股数(即已全部到账) 才清。
+        if (_ps34 > 0
+                and _PENDING_BUYS.get(code, 0) > 0
+                and _ps34 >= int(state.get("position_shares", 0) or 0)):
             _pending_clear(code, "券商已追平在途买单")
             # 持仓追平=委托实际成交 -> 此前“超时未成交”判定是误判，清零失败计数/熔断
             if _ps34 > 0:
@@ -9161,6 +9284,17 @@ def _handlebar_impl(C, code, cfg, params, state):
     # 持仓盘中触及涨停价 且 浮盈>0 -> 立即全部卖出；卖出后当日该标的不再买入。
     # 红线保障：sell_all 内「绝不亏损卖出」盈亏复核闸门仍然生效。
     _today_str = datetime.now().strftime("%Y-%m-%d")
+    # P3-1(2026-10-30 评审修复)：把「卖出已在途」短路提到涨停卖出【之前】。
+    #   原布局：涨停卖出(L9277) -> 止盈前置检查(L9306)，于是涨停卖单跨 bar 未成交、
+    #   且价格仍封在涨停价时，每根 bar 都会重复发一笔卖单（每笔都付一次 5 元最低佣金，
+    #   还可能触发柜台"卖出可用不足"废单）。现统一前置，两条卖出路径共用一个闸门。
+    _spu_pre = float(state.get("sell_pending_until", 0.0) or 0.0)
+    if _spu_pre > time.time():
+        if _diag_due(code):
+            log("[%s] 卖出决策跳过：上笔卖单仍在途(冻结至 %s)，等成交/超时结算后再评估"
+                % (code, time.strftime("%H:%M:%S", time.localtime(_spu_pre))))
+        save_state(code, state)
+        return
     if (actual_vol > 0 and up and up > 0 and price >= up
             and state.get("limit_sell_date", "") != _today_str):
         _avg_cost = (state["total_cost"] / state["position_shares"])             if state.get("position_shares") else 0.0

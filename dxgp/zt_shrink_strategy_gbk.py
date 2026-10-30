@@ -1,7 +1,18 @@
 #coding:gbk
 """
 涨停缩量低吸策略 (某券商QMT策略交易端 内置Python框架版)
-# 版本号: V2.6.195           修改时间: 2026-10-30 13:32 (V2.6.195记录: 公告接口深度上限落地 —— 实测确认翻页硬顶 500 页/5 万条(第 501 页起每页首条 art_code 完全相同, 定格 2026-09-22), 45 天窗口在该接口本不可达, 天花板 39 天;
+# 版本号: V2.6.196           修改时间: 2026-10-30 15:30 (V2.6.196记录: 按第三方代码评审报告修复 P2/P3 共 3 项(GBK 直改, 编码不变);
+#   (1)P2-1 买入重报追单三处额度缺陷: ①量纲混用——abs_cap_left() 返回【股数】而 _self_occ6 是【金额】,
+#      旧写法 (_left6+_self_occ6)/px 等于'0股+2万元'/20元=1000股, 已占用205000元(超20万上限)时仍放行1000股,
+#      STRATEGY_CASH_CAP 在重报路径上完全失效; 现改用金额口径 max(0,STRATEGY_CASH_CAP-max(0,used_capital()-自身占用)) 再折股;
+#      ②单票剩余额度 _amts_r168 漏加自身占用, 超单票上限一半的建仓单追单时剩余额度算成不足一手 -> 放弃追单并留下 vol=0/pend_vol=0 僵尸占位;
+#      ③used_capital() 对纯占位单双倍计入(占位时 cost_total 已含全额在途成本, 又加 pend_volx均价), 2万元买单占4万元额度;
+#      现仅在已有成交股数(fill_vol>0)时才另加在途部分;
+#   (2)P2-2 卖出前先撤销本标的在途买入/加仓单: 旧实现只在卖出流程'不再发新加仓单', 却不撤同一天早些时候已挂出、仍在券商排队的加仓单;
+#      卖单成交清仓删除 hold[s] 后, 该孤儿单若随后成交, deal_callback 会重新创建 hold[s] -> 仓位死灰复燃(等于卖出后又被买回);
+#      现在卖出决策生效点集中撤销: 撤单成功即清 pend_vol/pend_oid 并摘除 buy_ctx, 撤单未确认则本轮暂缓卖出;
+#   (3)P3-2 _LOG_KEY_ALWAYS 同类问题在 dxgp 侧复核: 已确认无同样的括号不匹配;
+#   铁律零触碰: 绝不止损/扣费后赚钱才卖/移交释放双额度/禁用xtquant/成交量单位为手 全部原样。)
 #   (1)策略侧: 排雷覆盖提示新增 dup_stop 分支 —— 撞到底时明确说"加大 --ann-pages 无效, 需另补公告数据源", 不再误导; 旧版只在页取数失败时纠正, dup 到底时仍喊加大页数;
 #   (2)修正两处注释里的工具文件名(实盘 bin.x64 下正品为 download_risk_exclude.py, 工作区 _tool_risk_exclude.py 是未被调用的旧副本);
 #   (3)配套: 生成端 download_risk_exclude.py 已移植 dup_stop(保留其独有 PAGE_FAIL_TOL 页级容错与 os.chdir 输出目录锚定); runner 的 --ann-pages 1400->600、超时 2400->1000, 止住每晚约 1100 秒无效扫描;
@@ -51,7 +62,7 @@
 #   修复: 桶内追加 last 字段记录最近一次 reason 原文, 格式化时优先展示 last, 无 last 的旧桶回退 sample;
 #     sample 仍保留首次值供追溯。零调用点改动 —— 26 种 reason 全部受益(缩量比/现价/成本等当前值可见);
 #   说明: 无新增模块级常量, 参数指纹不变(仅版本指纹随 VERSION 变化); 交易判据/绝不止损/买卖阈值/风控闸门 一行未动; 全程 GBK 编码, 无乱码)。
-# >>> GBK 代码文件已更新至最新版本 V2.6.195 (2026-10-30 13:32)。
+# >>> GBK 代码文件已更新至最新版本 V2.6.196 (2026-10-30 15:30)。
 # 版本号: V2.6.186           修改时间: 2026-10-28 11:04 (V2.6.186记录: 修掉情绪"信号详细构成"双标题冗余 —— 纯显示修复, 零交易影响;
 #   现象: 实盘输出为「信号详细构成(涨跌比例z值,强势股比例z值,成交额z值): 信号详细构成(逐分量 标准差倍数 z值 x 权重 = 贡献):」
 #     两层标题叠加(磁盘 run.log 原始字节已确认), 且旧标题描述的是旧口径, 与新体例并列易被误读成"两套口径";
@@ -871,7 +882,7 @@ EXCLUDE_KCB = False            # 2026-10-14用户确认开启: 放开科创板688/689进入选
 EXCLUDE_CYB = True             # 是否剔除创业板300/301
                                 # 2026-10-14用户确认开启: 创业板20%涨跌幅, 与"绝不止损"铁律冲突(一旦深套回本难度翻倍),
                                 # 剔除更稳健; 只影响新买入选股范围, 不影响已持有仓位。
-VERSION = 'V2.6.195'    # 当前版本号(与启动日志和横幅展示一致; 改版需同步文件头版本注释)
+VERSION = 'V2.6.196'    # 当前版本号(与启动日志和横幅展示一致; 改版需同步文件头版本注释)
 # V2.6.173(第18轮全新独立深度审计)新增模块级大写常量(会改变参数指纹, 属预期):
 #   HANDOFF_COUNT_IN_CAP=False  —— 移交仓是否计入 STRATEGY_CASH_CAP 分子(默认False=维持用户铁律)
 #   BLACKLIST_RECHECK_SEC=60    —— 人工黑名单发单前强制重读的节流间隔
@@ -3575,10 +3586,21 @@ def used_capital():
                 continue        # V2.6.185: 已全部卖出的仓位不占用资金额度
             if is_handoff(_h) and not HANDOFF_COUNT_IN_CAP:
                 continue        # 移交释放双额度(用户铁律); HANDOFF_COUNT_IN_CAP=True 时改为计入上限
+            # P2-1(2026-10-30 评审修复)：新建仓占位单被双倍计入。
+            #   buy_stock 占位时 cost_total 已预填【含在途股数】的全额成本
+            #   (cost_total = px*vol + fee，fill_vol=0)，随后又设 pend_vol=vol。
+            #   旧实现无条件累加 pos_cost + pend_vol×均价 -> 一笔 2 万元的未成交买单
+            #   占用 4 万元额度（2 倍），20 万上限被提前打满，正常建仓被判"额度不足"。
+            #   现按两种形态区分：
+            #     · 已有成交股数(fill_vol>0)：pos_cost 只含已成交部分，
+            #       在途部分需另加 pend_vol×均价（原行为，正确）；
+            #     · 纯占位单(成交股数=0)：cost_total 已含全额在途成本，
+            #       不能再加，否则重复计算。
             inv += _f(pos_cost(_h))
             _pv = int(_f(_h.get('pend_vol', 0) or 0))
+            _fv = int(_f(_h.get('fill_vol', 0) or 0))
             _hv = int(pos_vol(_h))
-            if _pv > 0 and _hv > 0:
+            if _pv > 0 and _fv > 0 and _hv > 0:
                 inv += _pv * (_f(pos_cost(_h)) / _hv)
     except Exception as _e:
         # P2-1修复(2026-10-19): 原异常分支 return 0.0 是 fail-open——占用资金算成0,
@@ -10700,6 +10722,32 @@ def sell_stock(s, h, pos_avail, lp, reason, tick=None):
             # 若此时进程重启, 待重试标记丢失, 重启后会重新评估卖出决策(重复走一遍重试链)
             save_state()
         return
+    # P2-2(2026-10-30 评审修复)：卖出前必须先撤掉本标的的在途【买入/加仓】委托。
+    #   病因：旧实现在卖出流程里只是不再发新的加仓单，却不会撤掉同一天早些时候
+    #   已挂出、还在券商排队的加仓单。卖单成交清仓后 hold[s] 被删除，
+    #   但那笔孤儿加仓单随后若成交，deal_callback 会重新创建 hold[s] -> 仓位死灰复燃，
+    #   等于"卖出后又被买回来"，且成交价/成本全部错位。
+    #   现于卖出决策生效点集中撤销：撤单成功即清 pend_vol，并从 buy_ctx 摘除，
+    #   使后续成交回报无法把该笔认成策略委托。
+    try:
+        _oid2 = str(h.get('pend_oid', '') or '')
+        _bv2 = int(_f(h.get('pend_vol', 0) or 0))
+        if _oid2 or _bv2 > 0:
+            _o2 = buy_order_obj(s)
+            if _o2 not in (None, '_ERR'):
+                if cancel_buy_order(s, _o2):
+                    log(disp(s), '卖出前撤销在途买入/加仓单 OrderID=%s(防清仓后孤儿单成交复活仓位)' % _oid2)
+                else:
+                    log(disp(s), '卖出前撤在途买单未确认, 本轮暂缓卖出(避免卖单与买单同标的对冲)')
+                    return
+            h['pend_vol'] = 0
+            h['pend_oid'] = ''
+            if isinstance(G.state.get('buy_ctx'), dict):
+                G.state['buy_ctx'].pop(s, None)
+            save_state()
+    except Exception as _e2:
+        log(disp(s), '卖出前撤在途买单异常(%s), 本轮暂缓卖出(拿不准就不动手)' % repr(_e2)[:100])
+        return
     # 新一笔卖出决策: 重置重试状态机(P1-2)
     h['sell_retries'] = 0
     h['sell_giveup'] = False
@@ -11434,7 +11482,18 @@ def handle_unfilled_buy(s, h, ords_snap=None):
         _caps6.append(int(_remain_one6 / px) if px > 0 else 0)
     _left6 = abs_cap_left(px)
     if _left6 is not None:
-        _caps6.append(int((_f(_left6) + _self_occ6) / px) if px > 0 else 0)
+        # P2-1(2026-10-30 评审修复)：量纲混用 —— abs_cap_left() 返回的是【股数】，
+        #   而 _self_occ6 是【金额(元)】。旧写法 (_left6 + _self_occ6) / px 等于
+        #   「0 股 + 20000 元」/ 20 元 = 1000 股，凭空放大额度：
+        #   已占用 205000 元(超 20 万上限)时 _left6=0，却仍算出 1000 股放行，
+        #   STRATEGY_CASH_CAP 总资金上限在重报路径上完全失效。
+        #   现改为：先用金额口径算出「本策略还能用多少钱」，再除以价格换成股数。
+        _cap_left_amt6 = float(STRATEGY_CASH_CAP) - max(0.0, used_capital() - _self_occ6) \
+            if STRATEGY_CASH_CAP and STRATEGY_CASH_CAP > 0 else None
+        if _cap_left_amt6 is not None:
+            _caps6.append(int(max(0.0, _cap_left_amt6) / px) if px > 0 else 0)
+        else:
+            _caps6.append(int(_f(_left6)) if _left6 > 0 else 0)
     _cash_vol6 = 0
     if px > 0:
         _cash_vol6 = int(_cash6 / px)
@@ -11450,7 +11509,11 @@ def handle_unfilled_buy(s, h, ords_snap=None):
     #   只削不增, 削平后不足一手则不发重报。
     _amts_r168 = []
     if MAX_POS_VALUE_ABS and MAX_POS_VALUE_ABS > 0:
-        _amts_r168.append(max(0.0, float(MAX_POS_VALUE_ABS) - _f(pos_cost(h))))
+        # P2-1(2026-10-30 评审修复)：漏加回本单自身占用 _self_occ6。
+        #   对于超过单票上限一半的建仓单(如上限 10 万、股价 45 元下 6 万买单)，
+        #   追单时剩余额度算成 10万-6万=4万 < 100股×45=4500，cap_fit_volume 直接返回 0，
+        #   放弃追单并在 hold 里留下 vol=0/pend_vol=0 的僵尸占位记录。
+        _amts_r168.append(max(0.0, float(MAX_POS_VALUE_ABS) - _f(pos_cost(h)) + _self_occ6))
     pend = normalize_buy_volume(s, cap_fit_volume(s, pend, px, _lot6, _amts_r168, '买入重报'))
     if pend <= 0:
         log(disp(s), '买入重报暂缓: 最新价下单票/组合额度或现金不足最小申报量(单票上限%.2f元)'
