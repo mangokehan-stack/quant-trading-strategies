@@ -7377,15 +7377,21 @@ def load_risk_exclude():
                         #   读起来像“没有风险”, 实际是“这一类根本没采到”。
                         #   方向必须说清, 否则这条日志比不打还误导。
                         _ann_txt = 'ann类0只(该类可能完全未采到, 不等于无风险)'
+                    _ann_seg = 0
+                    try:
+                        _ann_seg = int(_annc.get('segments') or 0)
+                    except Exception:
+                        _ann_seg = 0
                     if bool(_annc.get('dup_stop')):
                         # 2026-10-30: 生成端已撞到公告接口翻页硬顶(实测第501页起
-                        #   每页首条 art_code 完全相同, 真实容量约500页/5万条)。
-                        #   此时"加大 --ann-pages"是错的方向, 必须改说真话。
+                        #   每页首条 art_code 完全相同, 单段真实容量约500页/5万条≈39天)。
+                        #   生成端现已按 end_time 分段接力(ANN_SEGMENTS, 默认2段≈78天),
+                        #   若分段后仍不够, 正确的处置是调大段数, 不是加大页数。
                         log('[排雷][提示] 公告实扫仅%d天(%s~%s, 仅覆盖%d天窗口的%.0f%%), %s —— '
-                            '已顶到公告接口翻页上限(实测约500页/5万条, 更早深页只返回重复数据), '
-                            '加大 --ann-pages 无效; 立案/处罚/退市风险警示可能漏检, 需另补公告数据源'
+                            '已顶到接口单段翻页上限(约500页/5万条≈39天), 本清单跑了%d段接力; '
+                            '加大 --ann-pages 无效, 若需更长窗口请调大生成端 ANN_SEGMENTS 段数'
                             % (_cdays, _annc['cover_from'], _annc['cover_to'], _wd_decl,
-                               _cdays * 100.0 / _wd_decl, _ann_txt))
+                               _cdays * 100.0 / _wd_decl, _ann_txt, max(_ann_seg, 1)))
                     else:
                         log('[排雷][提示] 公告实扫仅%d天(%s~%s, 仅覆盖%d天窗口的%.0f%%), %s —— '
                             '立案/处罚/退市风险警示可能漏检, 需加大 --ann-pages'

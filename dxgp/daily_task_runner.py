@@ -92,7 +92,7 @@ def main():
 
     ok1, c1, e1 = run_step('calendar', 'download_trading_calendar.py', [], 300)
     ok2, c2, e2 = run_step('risk-exclude', 'download_risk_exclude.py',
-                           ['--account', ACCOUNT, '--ann-pages', '600'], 1000)
+                           ['--account', ACCOUNT, '--ann-pages', '600'], 1800)
 
     el = time.time() - t_all
     if ok1 and ok2:

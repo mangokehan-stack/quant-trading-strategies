@@ -363,10 +363,20 @@ def fetch_loss(bag, days, timeout):
 # ------------------------------------------------------------------ 5) 公告
 # 2026-10-30 P3: 公告扫描页级容错 —— 连续这么多页取数失败即判定通道不可用, 提前收尾
 PAGE_FAIL_TOL = 3
+# 2026-10-30: 公告接口单段回溯上限约 39 天(500 页/5 万条硬顶)，45 天窗口需 2 段接力。
+#   1=完全退回旧行为(单段)；2=可覆盖约 78 天；调大更久但更慢。
+ANN_SEGMENTS = 2
 
 
-def fetch_ann(bag, days, timeout, max_pages):
-    cutoff = iso(datetime.date.today() - datetime.timedelta(days=int(days)))
+def fetch_ann(bag, days, timeout, max_pages, end_time=None, cutoff=None):
+    """扫描公告并提取风险关键词。
+
+    2026-10-30 分段回溯：end_time 给定时，以该日为锚向前回溯（接口单段约 39 天上限）；
+    cutoff 给定时用它作为窗口下界（多段接力时沿用总窗口起点，而非按段重算）。
+    """
+    if cutoff is None:
+        cutoff = iso(datetime.date.today() - datetime.timedelta(days=int(days)))
+    _end_q = ('&end_time=%s' % end_time) if end_time else ''
     n, hit, skip = 0, 0, 0
     # 2026-10-30 P3: err_pg=取数失败被跳过的页数, consec=当前连续失败页数(取数韧性统计)
     err_pg, consec = 0, 0
@@ -378,7 +388,8 @@ def fetch_ann(bag, days, timeout, max_pages):
     prev_sig = None
     dmin, dmax = '', ''      # 2026-10-19新增: 本轮真正扫到的公告日期区间, 用于暴露"窗口没走完"
     for pg in range(1, int(max_pages) + 1):
-        u = (ANN + '?sr=-1&page_size=100&page_index=%d&ann_type=A&client_source=web' % pg)
+        u = (ANN + '?sr=-1&page_size=100&page_index=%d&ann_type=A&client_source=web%s'
+             % (pg, _end_q))
         # 2026-10-30 P3: 单页取数失败不再让整条 ann 通道归零。
         #   病因: http_json 内部已重试 3 次, 仍旧失败就抛异常; 旧版循环体内无 try,
         #   任意一页网络抖动都会让 ann 类风险股(立案/处罚/退市风险警示/ST)整类消失,
@@ -491,11 +502,42 @@ def build(days, timeout, skip_ann, ann_pages, account=''):
     else:
         t0 = time.time()
         try:
-            hit, seen, skip, dmin, dmax, err_pg, dup_stop = fetch_ann(
-                bag, days, timeout, ann_pages)
+            # 2026-10-30 分段回溯：单段最多约 39 天（接口 500 页 / 5 万条硬顶），
+            #   45 天窗口需 2 段接力。段数 ANN_SEGMENTS 可调，1=退回旧行为。
+            _cut_all = iso(datetime.date.today() - datetime.timedelta(days=int(days)))
+            _segs = max(1, int(ANN_SEGMENTS))
+            _end_anchor = None
+            hit = seen = skip = err_pg = 0
+            dmin = dmax = ''
+            dup_stop = False
+            _seg_done = 0
+            for _si in range(_segs):
+                _h, _n, _sp, _d0, _d1, _ep, _dup = fetch_ann(
+                    bag, days, timeout, ann_pages,
+                    end_time=_end_anchor, cutoff=_cut_all)
+                hit += _h; seen += _n; skip += _sp; err_pg += _ep
+                if _d0 and (not dmin or _d0 < dmin):
+                    dmin = _d0
+                if _d1 and (not dmax or _d1 > dmax):
+                    dmax = _d1
+                dup_stop = bool(dup_stop or _dup)
+                _seg_done += 1
+                if not _d0 or _d0 <= _cut_all:
+                    break          # 已覆盖到窗口起点，无需再往前
+                # 下一段锚点 = 本段最早日期的前一天
+                try:
+                    _prev = (datetime.datetime.strptime(_d0, '%Y-%m-%d').date()
+                             - datetime.timedelta(days=1))
+                    _end_anchor = _prev.strftime('%Y-%m-%d')
+                except Exception:
+                    break
+            if _seg_done > 1:
+                print(u'       [ann] 分段回溯 %d 段完成, 累计扫描 %d 条, 覆盖 %s ~ %s'
+                      % (_seg_done, seen, dmin or '?', dmax or '?'))
             sources['ann'] = {'ok': True, 'n': hit, 'seen': seen, 'skip_note': skip,
                               'cover_from': dmin, 'cover_to': dmax,
                               'dup_stop': bool(dup_stop),
+                              'segments': int(_seg_done),
                               'sec': round(time.time() - t0, 1)}
             if err_pg:
                 # 2026-10-30 P3: 部分降级留痕, 便于事后审计"这天的清单少扫了几页"
@@ -521,7 +563,7 @@ def build(days, timeout, skip_ann, ann_pages, account=''):
                     _need = 0
                     if _span > 0:
                         _need = (int(seen * int(days) / _span) + 99) // 100
-                    if dup_stop:
+                    if dup_stop and dmin > _cut:
                         print(u'       公告实扫区间 %s ~ %s (%d天, 实扫%d页) —— 已顶到接口翻页'
                               u'上限(实测约500页/5万条, 更早的深页返回重复数据), %d天窗口'
                               u'本接口不可达; 加大 --ann-pages 无效, 需另补公告数据源'
