@@ -17,11 +17,11 @@
 
 用法
 ----
-  python download_risk_exclude.py                 # 默认 45 天窗口，写当前目录
-  python download_risk_exclude.py --days 60       # 放宽/收紧窗口
-  python download_risk_exclude.py --account 12345678   # 生成带账号后缀的文件(与策略状态文件同规则)
-  python download_risk_exclude.py --skip-ann      # 跳过公告抓取(最快, 约5秒)
-  python download_risk_exclude.py --self-test     # 离线自检: 不联网, 用内置样例写一份JSON
+  python _tool_risk_exclude.py                 # 默认 45 天窗口，写当前目录
+  python _tool_risk_exclude.py --days 60       # 放宽/收紧窗口
+  python _tool_risk_exclude.py --account 12345678   # 生成带账号后缀的文件(与策略状态文件同规则)
+  python _tool_risk_exclude.py --skip-ann      # 跳过公告抓取(最快, 约5秒)
+  python _tool_risk_exclude.py --self-test     # 离线自检: 不联网, 用内置样例写一份JSON
 
 退出码: 0=成功(至少一个数据源有效) / 2=全部数据源失败(不覆盖已有文件) / 3=参数错误
 
@@ -354,15 +354,53 @@ def fetch_loss(bag, days, timeout):
 
 # ------------------------------------------------------------------ 5) 公告
 def fetch_ann(bag, days, timeout, max_pages):
+    """公告通道：扫描东财公告列表，提取风险关键词命中。
+
+    2026-10-30 (V2.6.193 配套·补齐生成端)：
+      (1) 页级容错 —— 单页取数失败只跳过该页继续扫，连续 3 页失败才提前收尾，
+          一页都没取到才整体失败。旧版任一页异常即整类 FAIL，而 ok_any 由其他
+          通道兜住、清单照样覆盖写盘 —— ann 数据全丢却看起来完整，漏检被静默掩盖。
+      (2) 重复页检测 —— 该接口翻页有物理上限(实测约 550 页/55000 条)，越过之后
+          深页循环返回同一批数据(首条 art_code 相同)。旧版把重复页当新数据再扫，
+          白耗约 200 秒且毫无收益；现发现重复页立即收尾。
+      (3) 回传 err_pages / dup_stop，写入 sources.ann 供策略侧告警。
+
+    返回 (hit, seen, skip, dmin, dmax, err_pages, dup_stop)
+    """
     cutoff = iso(datetime.date.today() - datetime.timedelta(days=int(days)))
     n, hit, skip = 0, 0, 0
+    err_pages = 0            # 取数失败被跳过的页数
+    dup_stop = False         # 是否因"深页重复(接口到底)"提前收尾
+    ok_req = 0               # 成功取到响应的页数(含空页)
+    fail_streak = 0          # 连续失败页数(达 3 页提前收尾)
+    prev_sig = None          # 上一页首条 art_code 指纹(判重)
     dmin, dmax = '', ''      # 2026-10-19新增: 本轮真正扫到的公告日期区间, 用于暴露"窗口没走完"
     for pg in range(1, int(max_pages) + 1):
-        u = (ANN + '?sr=-1&page_size=100&page_index=%d&ann_type=A&client_source=web' % pg)
-        j = http_json(u, timeout=timeout)
-        lst = ((j.get('data') or {}).get('list') or [])
+        try:
+            u = (ANN + '?sr=-1&page_size=100&page_index=%d&ann_type=A&client_source=web' % pg)
+            j = http_json(u, timeout=timeout)
+            lst = ((j.get('data') or {}).get('list') or [])
+        except Exception as _pe:
+            err_pages += 1
+            fail_streak += 1
+            print(u'       [ann] 第%d页取数失败(%r), 跳过续扫 (累计跳过%d页)'
+                  % (pg, _pe, err_pages))
+            if fail_streak >= 3:
+                print(u'       [ann] 连续%d页取数失败, 提前收尾(已成功%d页)' % (fail_streak, ok_req))
+                break
+            continue
+        fail_streak = 0
+        ok_req += 1
         if not lst:
             break
+        # 重复页检测：接口深页会循环返回同一批(首条 art_code 相同)
+        _sig = str((lst[0] or {}).get('art_code') or '') or None
+        if _sig and prev_sig and _sig == prev_sig:
+            dup_stop = True
+            print(u'       [ann] 第%d页与上一页首条相同(接口翻页已到底), 提前收尾(已成功%d页)'
+                  % (pg, ok_req))
+            break
+        prev_sig = _sig
         oldest = ''
         for a in lst:
             nd = str(a.get('notice_date') or '')[:10]
@@ -398,7 +436,9 @@ def fetch_ann(bag, days, timeout, max_pages):
         n += len(lst)
         if oldest and oldest < cutoff:
             break
-    return hit, n, skip, dmin, dmax
+    if ok_req <= 0:
+        raise RuntimeError(u'公告通道一页都没取到(跳过%d页), 整类失败' % err_pages)
+    return hit, n, skip, dmin, dmax, err_pages, dup_stop
 
 
 # ------------------------------------------------------------------ 主流程
@@ -443,12 +483,25 @@ def build(days, timeout, skip_ann, ann_pages, account=''):
     else:
         t0 = time.time()
         try:
-            hit, seen, skip, dmin, dmax = fetch_ann(bag, days, timeout, ann_pages)
+            hit, seen, skip, dmin, dmax, _err_pages, _dup_stop = fetch_ann(
+                bag, days, timeout, ann_pages)
+            # 2026-10-30 (V2.6.193 配套)：把"部分降级"写进 sources，供策略侧告警。
+            #   degraded=True 表示本次有页取数失败被跳过(清单仍可用, 但 ann 类可能漏检)；
+            #   dup_stop=True 表示撞到接口翻页物理上限(实测约550页), 再加大 --ann-pages 无效。
             sources['ann'] = {'ok': True, 'n': hit, 'seen': seen, 'skip_note': skip,
                               'cover_from': dmin, 'cover_to': dmax,
+                              'err_pages': int(_err_pages or 0),
+                              'dup_stop': bool(_dup_stop),
+                              'degraded': bool((_err_pages or 0) > 0),
                               'sec': round(time.time() - t0, 1)}
             print('  [OK] %-9s %4d 条命中 / 扫描%d条公告 / 跳过合规说明句%d条 (%.1fs)'
                   % ('ann', hit, seen, skip, time.time() - t0))
+            if _err_pages:
+                print(u'       [ann][部分降级] 本次有 %d 页取数失败被跳过 —— ann 类可能漏检, '
+                      u'建议排查网络后重跑工具' % _err_pages)
+            if _dup_stop:
+                print(u'       [ann] 撞到接口翻页上限(深页重复), 更早的公告本轮取不到；'
+                      u'这是数据源限制, 加大 --ann-pages 无效')
             # 2026-10-19 修正: 旧版只打"扫描2000条公告", 看不出 45 天窗口其实只走了 4 天
             #   (2000条=20页上限跑满, 不是撞到窗口起点才停), 立案/处罚的漏检被伪装成[OK]。
             if dmin and dmax:
@@ -489,7 +542,7 @@ def build(days, timeout, skip_ann, ann_pages, account=''):
         'stocks': bag.to_dict(),
         'sources': sources,
         'errors': errors,
-        'note': u'本文件由 download_risk_exclude.py 自动生成; 策略侧命中即拒绝买入(不影响卖出与持仓管理)',
+        'note': u'本文件由 _tool_risk_exclude.py 自动生成; 策略侧命中即拒绝买入(不影响卖出与持仓管理)',
     }
     return out, ok_any
 
